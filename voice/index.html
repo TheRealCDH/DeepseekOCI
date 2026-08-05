@@ -24,7 +24,15 @@
   .ai { align-self: flex-start; background: var(--panel); border-bottom-left-radius: 4px; }
   .err { align-self: stretch; background: #3a1f24; color: #ffb3bb; font-size: 14px; border-radius: 10px; }
   .think { align-self: flex-start; color: var(--dim); font-size: 13px; font-style: italic; }
-  footer { padding: 14px 16px calc(18px + env(safe-area-inset-bottom)); border-top: 1px solid #262d36; display: flex; align-items: center; gap: 14px; }
+  footer { padding: 14px 16px calc(18px + env(safe-area-inset-bottom)); border-top: 1px solid #262d36; display: flex; flex-direction: column; gap: 12px; }
+  footer .row { display: flex; align-items: center; gap: 14px; width: 100%; }
+  #textrow { display: flex; gap: 10px; width: 100%; }
+  #text { flex: 1; min-width: 0; background: var(--panel); color: var(--fg); font-size: 16px;
+          border: 1px solid #333c48; border-radius: 11px; padding: 11px 13px; }
+  #text:focus { outline: none; border-color: var(--accent); }
+  #send { flex: none; width: 46px; border: none; border-radius: 11px; background: var(--accent);
+          color: #fff; font-size: 17px; cursor: pointer; }
+  #send:disabled { background: #39424e; color: #7e8896; }
   #mic {
     width: 68px; height: 68px; border-radius: 50%; border: none; flex: none;
     background: var(--accent); color: #fff; font-size: 27px; cursor: pointer;
@@ -48,6 +56,11 @@
 </header>
 <div id="log"></div>
 <footer>
+  <form id="textrow" autocomplete="off">
+    <input id="text" type="text" placeholder="Type a message…" enterkeyhint="send">
+    <button id="send" type="submit" aria-label="Send">&#10148;</button>
+  </form>
+  <div class="row">
   <button id="mic" aria-label="Record">&#127908;</button>
   <div class="opts">
     <label><input type="checkbox" id="thinking" checked> Thinking (slower, better)</label>
@@ -58,6 +71,7 @@
         <option value="kokoro">Kokoro (faster)</option>
       </select>
     </label>
+  </div>
   </div>
 </footer>
 
@@ -204,6 +218,30 @@ function stopRec() {
   micEl.classList.remove("rec");
 }
 
+// Text path. Shares ask() with the voice path, so replies stream and are spoken
+// identically whichever way the question arrived — the TTS toggle still applies.
+const textEl = document.getElementById("text");
+const sendEl = document.getElementById("send");
+document.getElementById("textrow").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const q = textEl.value.trim();
+  if (!q || busy) return;
+  textEl.value = "";
+  // Typing is a user gesture, so unlock audio here too — otherwise the first spoken
+  // reply after a text-only start is silently blocked by Android's autoplay policy.
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+  add("me", q);
+  busy = true; micEl.disabled = true; sendEl.disabled = true;
+  try {
+    await ask(q);
+  } catch (err) {
+    add("err", err.message);
+  } finally {
+    busy = false; micEl.disabled = false; sendEl.disabled = false; setStatus("idle");
+  }
+});
+
 micEl.addEventListener("click", async () => {
   if (busy) return;
   if (recording) stopRec(); else await startRec();
@@ -227,7 +265,7 @@ async function handleAudio(blob) {
   } catch (e) {
     add("err", e.message);
   } finally {
-    busy = false; micEl.disabled = false; setStatus("idle");
+    busy = false; micEl.disabled = false; sendEl.disabled = false; setStatus("idle");
   }
 }
 
