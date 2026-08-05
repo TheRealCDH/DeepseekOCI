@@ -10,6 +10,9 @@ metadata:
   annotations:
     tailscale.com/expose: "true"
     tailscale.com/hostname: "speech"
+    # REQUIRED. Without it the operator silently ignores the Service — no proxy
+    # StatefulSet, no error, nothing in its logs. Matches the deepseek service.
+    tailscale.com/tags: "tag:k8s-operator"
   labels:
     app.kubernetes.io/name: speaches
 spec:
