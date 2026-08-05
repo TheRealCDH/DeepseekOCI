@@ -207,6 +207,14 @@ function add(cls, text) {
 const slots = [];
 let fetching = 0;
 let playing = false;
+// Bumped by stopAll(). A play loop captures it on entry and exits as soon as it
+// no longer matches, so a cancelled loop cannot keep pulling clips off the queue
+// alongside the loop started by the next prompt — which is what made two replies
+// play interleaved.
+let gen = 0;
+// Resolver for the clip currently playing, so stopAll can complete the promise a
+// paused <audio> would otherwise never settle (pause does not fire onended).
+let currentResolve = null;
 const MAX_INFLIGHT = 3;   // matches the server's --max-batch
 // Minimum characters before a chunk is sent for synthesis. Larger chunks mean
 // fewer utterance onsets and more natural phrasing across a sentence boundary;
@@ -234,16 +242,20 @@ async function enqueue(text) {
 }
 
 async function play() {
+  const myGen = gen;
   playing = true;
-  while (slots.length) {
+  while (slots.length && myGen === gen) {
     const slot = slots.shift();
     try {
-      await playPCM(await trimSilence(await slot));
+      const buf = await trimSilence(await slot);
+      if (myGen !== gen) break;          // stopped while this clip was synthesising
+      await playPCM(buf);
     } catch (e) {
+      if (myGen !== gen) break;
       add("err", "Speech failed: " + e.message);
     }
   }
-  playing = false;
+  if (myGen === gen) playing = false;
 }
 
 // Playback. Qwen3 speaks at ~127 wpm against ~150 for normal conversation, and the
@@ -295,13 +307,27 @@ function playPCM(arrayBuffer) {
   return new Promise((resolve) => {
     const url = URL.createObjectURL(new Blob([arrayBuffer], { type: "audio/wav" }));
     const a = new Audio();
-    a.preservesPitch = true;
-    a.mozPreservesPitch = true;
-    a.webkitPreservesPitch = true;
-    a.playbackRate = rate;
     a.src = url;
     nowPlaying = a;
-    const done = () => { URL.revokeObjectURL(url); nowPlaying = null; resolve(); };
+    currentResolve = resolve;
+    // playbackRate MUST be applied after the media loads. Setting it before src is
+    // silently discarded when the element loads its source, which is why the speed
+    // slider appeared to do nothing. preservesPitch is set alongside it so the
+    // speed-up time-stretches instead of raising pitch.
+    const applyRate = () => {
+      a.preservesPitch = true;
+      a.mozPreservesPitch = true;
+      a.webkitPreservesPitch = true;
+      a.playbackRate = rate;
+    };
+    a.addEventListener("loadedmetadata", applyRate);
+    a.addEventListener("play", applyRate);
+    const done = () => {
+      URL.revokeObjectURL(url);
+      nowPlaying = null;
+      if (currentResolve === resolve) currentResolve = null;
+      resolve();
+    };
     a.onended = done;
     a.onerror = () => { URL.revokeObjectURL(url); playViaWebAudio(arrayBuffer, rate).then(resolve, resolve); };
     a.play().catch(() => {
@@ -406,12 +432,16 @@ let abortCtl = null;
 let nowPlaying = null;
 
 function stopAll() {
+  gen++;                                 // orphan any running play loop
   if (abortCtl) { abortCtl.abort(); abortCtl = null; }
   slots.length = 0;                      // drop pending synthesis
   if (nowPlaying) {
     try { nowPlaying.pause ? nowPlaying.pause() : nowPlaying.stop(); } catch {}
     nowPlaying = null;
   }
+  // Settle the in-flight clip's promise; a paused <audio> never fires onended, so
+  // without this the old loop would await it forever.
+  if (currentResolve) { const r = currentResolve; currentResolve = null; r(); }
   playing = false;
   busy = false;
   micEl.disabled = false;
@@ -684,6 +714,7 @@ async function ask(text) {
   let sse = "", spoken = "", full = "";
   let bubble = null, thinkNote = null;
 
+  try {
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -735,12 +766,23 @@ async function ask(text) {
     }
   }
 
+  } catch (e) {
+    // Aborted by the stop button. Record whatever was said so the transcript and
+    // the model's context both show an interrupted answer rather than nothing.
+    if (full) history.push({ role: "assistant", content: full + " […interrupted]" });
+    stopEl.hidden = true;
+    abortCtl = null;
+    if (e && e.name === "AbortError") return full;
+    throw e;
+  }
+
   // Anything after the last sentence terminator.
   const tail = full.slice(spoken.length).trim();
   if (tail) enqueue(tail);
   stopEl.hidden = true;
   abortCtl = null;
   if (full) history.push({ role: "assistant", content: full });
+  return full;
   if (!full) add("err", "Model returned no speakable content (it may have spent the whole budget thinking).");
 }
 
