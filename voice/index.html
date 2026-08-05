@@ -396,12 +396,22 @@ function encodeWav(audioBuffer) {
   return buf;
 }
 
+// Reference clips are CAPPED. Cloning needs only a few seconds — upstream
+// advertises a "3-second rapid voice clone" — but a whole song or podcast
+// re-rendered to 24 kHz mono is ~48 KB/s, so a 10 minute file becomes ~29 MB of
+// WAV and ~38 MB once base64'd. That blew nginx's 32 MB body limit and every mp3
+// upload failed with a 413. Raising the limit would only move the wall; sending
+// less is the actual fix, and it makes the upload and the Whisper pass fast too.
+const CLONE_MAX_SEC = 15;
+
 async function toWav24k(blob) {
   const raw = await blob.arrayBuffer();
   const tmp = new (window.AudioContext || window.webkitAudioContext)();
   const decoded = await tmp.decodeAudioData(raw);
-  // Resample to mono 24 kHz, which is what the codec expects.
-  const off = new OfflineAudioContext(1, Math.ceil(decoded.duration * 24000), 24000);
+  // Resample to mono 24 kHz, which is what the codec expects, taking at most
+  // CLONE_MAX_SEC from the start.
+  const secs = Math.min(decoded.duration, CLONE_MAX_SEC);
+  const off = new OfflineAudioContext(1, Math.ceil(secs * 24000), 24000);
   const src = off.createBufferSource();
   src.buffer = decoded;
   src.connect(off.destination);
@@ -500,12 +510,15 @@ async function transcribe(blob, filename) {
 }
 
 async function finishClone(name, blob, filename) {
-  setStatus("registering voice…");
+  setStatus("preparing clip…");
   try {
-    // ref_text switches the server to ICL clone mode, which is better than
-    // x-vector only, so it is worth a Whisper pass first.
-    const refText = await transcribe(blob, filename);
+    // Trim FIRST, then transcribe the trimmed audio. Transcribing the original
+    // would describe material the reference clip does not contain, and ICL clone
+    // mode expects ref_text to be the transcript of the reference itself.
     const wav = await toWav24k(blob);
+    setStatus("transcribing…");
+    const refText = await transcribe(new Blob([wav], { type: "audio/wav" }), "ref.wav");
+    setStatus("registering voice…");
     await registerClip(name, wav, refText);
     await saveClip(name, wav, refText);
     add("think", "Voice '" + name + "' registered and saved" +
@@ -555,7 +568,7 @@ cloneFileEl.addEventListener("change", async () => {
   if (!f) return;
   const name = (prompt("Name for the cloned voice (letters/numbers):") || "").trim();
   if (!name) return;
-  add("think", "Encoding " + f.name + "…");
+  add("think", "Using the first " + CLONE_MAX_SEC + "s of " + f.name + "…");
   await finishClone(name, f, f.name);
 });
 
