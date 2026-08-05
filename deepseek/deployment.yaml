@@ -1,0 +1,104 @@
+# DeepSeek-V4-Flash served by llama.cpp on Ripnix, CPU-only.
+#
+# WHY hostPath AND NOT A PVC: the 84.7 GiB GGUF already lives on the node at
+# /models (ZFS dataset zroot/models). Copying it into a PVC would duplicate 85 GiB
+# for no benefit. Mounted read-only; the container never writes to it.
+#
+# WHY NO GPU: owner decision. The model is ~85 GiB and the node's cards are 8 GiB
+# each, so offload would hold <10% of the weights while competing with Jellyfin
+# (transcoding) and the planned STT/TTS workloads. The eight memory channels are
+# what make this viable — see PLAN.md §2 and §15.
+#
+# IMAGE PIN: llama.cpp gained `deepseek4` architecture support in PR #24162, merged
+# 2026-06-29. Anything older fails with `unknown model architecture: 'deepseek4'` —
+# verified: nixpkgs 26.05 ships b9190 (commit b64739e, 2026-05-16) and rejects this
+# model outright. b10257 is well past the merge. DO NOT float this to :server.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek
+  labels:
+    app.kubernetes.io/name: deepseek
+spec:
+  replicas: 1
+  strategy:
+    # A second replica would try to map another 85 GiB before the first exits.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: deepseek
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: deepseek
+    spec:
+      # The model file only exists on ripnix. Single-node cluster today, but be explicit
+      # so this cannot schedule somewhere the hostPath is empty.
+      nodeSelector:
+        kubernetes.io/hostname: ripnix
+      containers:
+        - name: llama-server
+          image: ghcr.io/ggml-org/llama.cpp:server-b10257
+          args:
+            # llama.cpp follows the split automatically from shard 00001.
+            - "--model"
+            - "/models/deepseek-v4-flash-UD-IQ2_M/UD-IQ2_M/DeepSeek-V4-Flash-UD-IQ2_M-00001-of-00003.gguf"
+            # 128K ceiling — KV cost is ~3.4 GiB, cheap against the headroom. Actually
+            # filling it in one paste costs hours of prefill; conversational turns only
+            # prefill new tokens because llama.cpp reuses KV across a shared prefix.
+            - "--ctx-size"
+            - "131072"
+            # 16 physical cores for decode. SMT gives little on MoE decode; 32 for the
+            # batch/prefill path, which parallelises better.
+            - "--threads"
+            - "16"
+            - "--threads-batch"
+            - "32"
+            # Flash attention — recommended by the V4 support PR.
+            - "-fa"
+            - "1"
+            # Enables OpenAI-compatible tool/function calling from the chat template.
+            # Test this early: structured output is the capability most likely to
+            # degrade at IQ2 (PLAN.md §17).
+            - "--jinja"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8080"
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+          resources:
+            requests:
+              cpu: "8"
+              memory: 8Gi
+            limits:
+              # Deliberately high. The GGUF is mmap'd, so its pages are charged to the
+              # cgroup as page cache; too low a limit causes constant reclaim and
+              # thrashing rather than a clean OOM. Node has 125.6 GiB with ARC capped
+              # at 16 GiB, leaving ~98 GiB available for an ~85 GiB model plus KV.
+              memory: 105Gi
+          # Loading ~85 GiB from NVMe takes 20-90 s, and first-token latency is slow by
+          # design. Generous probes prevent the kubelet killing it mid-load.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 15
+            failureThreshold: 40      # up to 10 minutes to become ready
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 60
+            timeoutSeconds: 15
+            failureThreshold: 5
+      volumes:
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory

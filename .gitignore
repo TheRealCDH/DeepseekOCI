@@ -1,0 +1,4 @@
+# Internal planning notes — NOT published. Contains infrastructure topology
+# (host/BMC/tailnet addresses), hardware inventory and incident history.
+# Flux does not need it; keep it local.
+PLAN.md

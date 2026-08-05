@@ -1,0 +1,19 @@
+# In-cluster endpoint. llama.cpp's server exposes BOTH:
+#   /            -> built-in chat WebUI
+#   /v1/...      -> OpenAI-compatible API (chat/completions, models, embeddings)
+# so anything that speaks the OpenAI API can point here, including MCP-capable
+# clients (MCP itself is client-side — the model only emits tool calls).
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek
+  labels:
+    app.kubernetes.io/name: deepseek
+spec:
+  selector:
+    app.kubernetes.io/name: deepseek
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  type: ClusterIP

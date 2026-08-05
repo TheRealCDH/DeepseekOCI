@@ -1,0 +1,22 @@
+# Exposes the llama.cpp WebUI + API on the tailnet.
+# Reachable at http://deepseek  (tailnet MagicDNS) once the operator provisions it.
+#
+# Same pattern as localDeepKube's tailscale-service.yaml, which already works against
+# the tailscale-operator running in this cluster (chart 1.98.9, ns `tailscale`).
+# Tailnet only — deliberately no public ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek-tailscale
+  annotations:
+    tailscale.com/expose: "true"
+    tailscale.com/tags: "tag:k8s-operator"
+    tailscale.com/hostname: "deepseek"
+spec:
+  selector:
+    app.kubernetes.io/name: deepseek
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+  type: ClusterIP
