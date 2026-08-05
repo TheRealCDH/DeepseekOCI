@@ -210,6 +210,88 @@ function add(cls, text) {
 // Each arriving block is scheduled on the AudioContext clock at the exact moment
 // the previous block ends, which makes playback gapless by construction rather
 // than by hoping the next clip is ready in time.
+// Time-stretching that preserves pitch (WSOLA).
+//
+// playbackRate on a BufferSource simply resamples: faster playback also raises
+// pitch, which is why speeding up made the voice sound nasally. The <audio>
+// element has preservesPitch and does this properly, but it cannot be used for
+// gapless scheduled streaming, so the stretch has to happen on the samples.
+//
+// WSOLA overlap-adds successive windows, choosing each source window from a small
+// search range so its waveform best matches what has already been written. Aligning
+// on waveform similarity rather than a fixed hop is what avoids the periodicity
+// artefacts of plain overlap-add, and pitch is untouched because no resampling
+// occurs.
+class Stretcher {
+  constructor(sampleRate) {
+    this.sr = sampleRate;
+    this.frame = Math.round(sampleRate * 0.040);        // 40ms window
+    this.half = this.frame >> 1;                        // 50% overlap
+    this.search = Math.round(sampleRate * 0.010);       // +/-10ms similarity search
+    this.buf = new Float32Array(0);
+    this.pos = 0;                                       // read cursor into buf
+    this.tail = new Float32Array(this.half);            // overlap carried between frames
+    this.win = new Float32Array(this.frame);
+    for (let i = 0; i < this.frame; i++) {
+      this.win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (this.frame - 1));
+    }
+  }
+
+  push(block) {
+    const keep = this.buf.length - this.pos;
+    const next = new Float32Array(keep + block.length);
+    next.set(this.buf.subarray(this.pos), 0);
+    next.set(block, keep);
+    this.buf = next;
+    this.pos = 0;
+  }
+
+  // Offset within the search range whose overlap best matches the current tail.
+  bestOffset(from) {
+    let best = 0, bestScore = -Infinity;
+    const limit = Math.min(this.search, this.buf.length - from - this.frame);
+    for (let off = 0; off <= Math.max(0, limit); off += 2) {
+      let acc = 0;
+      for (let i = 0; i < this.half; i += 4) acc += this.tail[i] * this.buf[from + off + i];
+      if (acc > bestScore) { bestScore = acc; best = off; }
+    }
+    return best;
+  }
+
+  // Produce stretched audio. rate > 1 speeds up, pitch unchanged.
+  pull(rate) {
+    if (rate === 1) {
+      const out = this.buf.subarray(this.pos);
+      this.pos = this.buf.length;
+      return out.slice();
+    }
+    const advance = Math.round(this.half * rate);       // input consumed per output half-frame
+    const out = [];
+    while (this.buf.length - this.pos >= this.frame + this.search + advance) {
+      const off = this.bestOffset(this.pos);
+      const from = this.pos + off;
+      const piece = new Float32Array(this.half);
+      // Cross-fade the carried tail with the head of the chosen window.
+      for (let i = 0; i < this.half; i++) {
+        const w = this.win[i + this.half];
+        piece[i] = this.tail[i] * w + this.buf[from + i] * this.win[i];
+      }
+      out.push(piece);
+      // Keep the window's second half as the next overlap.
+      this.tail = this.buf.slice(from + this.half, from + this.frame);
+      if (this.tail.length < this.half) this.tail = new Float32Array(this.half);
+      this.pos += advance;
+    }
+    if (!out.length) return new Float32Array(0);
+    let n = 0;
+    for (const b of out) n += b.length;
+    const merged = new Float32Array(n);
+    let o = 0;
+    for (const b of out) { merged.set(b, o); o += b.length; }
+    return merged;
+  }
+}
+
 const SR = 24000;                 // server output rate, s16le mono
 const PREBUFFER = 0.35;           // seconds of audio to accumulate before starting
 
@@ -267,19 +349,17 @@ async function drainText() {
 // Schedule one block of PCM back-to-back with whatever is already queued.
 function schedule(f32, ctx) {
   if (!f32.length) return;
-  const rate = +speedEl.value || 1;
   const buf = ctx.createBuffer(1, f32.length, SR);
   buf.copyToChannel(f32, 0);
   const src = ctx.createBufferSource();
   src.buffer = buf;
-  // playbackRate shifts pitch slightly; preservesPitch is not available on a
-  // BufferSource. At 1.1-1.2x that is a small trade for gapless output.
-  src.playbackRate.value = rate;
+  // No playbackRate here — speed is applied by the Stretcher before scheduling,
+  // so pitch is preserved. Resampling here would undo that.
   src.connect(ctx.destination);
   const now = ctx.currentTime;
   if (nextAt < now + 0.02) nextAt = now + 0.02;   // never schedule in the past
   src.start(nextAt);
-  nextAt += buf.duration / rate;
+  nextAt += buf.duration;
   liveSources.push(src);
   src.onended = () => { liveSources = liveSources.filter((x) => x !== src); };
 }
@@ -310,6 +390,10 @@ async function speakStream(text, myGen) {
   }
 
   const reader = r.body.getReader();
+  // One stretcher per utterance: its overlap state must not carry across a gap
+  // in the audio, and the rate is read per block so moving the slider mid-reply
+  // takes effect on what has not been scheduled yet.
+  const stretch = new Stretcher(SR);
   let carry = new Uint8Array(0);
   let started = false;
   let pre = [];
@@ -334,10 +418,14 @@ async function speakStream(text, myGen) {
     const f32 = new Float32Array(n);
     for (let i = 0; i < n; i++) f32[i] = view.getInt16(i * 2, true) / 32768;
 
+    stretch.push(f32);
+    const shaped = stretch.pull(+speedEl.value || 1);
+    if (!shaped.length) continue;
+
     if (!started) {
       // Hold a little audio back before starting, so a slow first block does not
       // cause an immediate underrun.
-      pre.push(f32); preLen += n;
+      pre.push(shaped); preLen += shaped.length;
       if (preLen >= SR * PREBUFFER) {
         const all = new Float32Array(preLen);
         let o = 0;
@@ -347,7 +435,7 @@ async function speakStream(text, myGen) {
         setStatus("speaking…");
       }
     } else {
-      schedule(f32, ctx);
+      schedule(shaped, ctx);
     }
   }
 
