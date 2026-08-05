@@ -701,9 +701,20 @@ async function ask(text) {
         thinkNote = add("think", "thinking…");
       }
       if (delta.content) {
+        // Strip stray think tags. With thinking DISABLED the DeepSeek chat template
+        // pre-fills a closing </think> into the assistant turn so the model continues
+        // after it; there is no matching opener, so llama.cpp's reasoning parser does
+        // not consume the pair and it leaks into content as a literal "</think>".
+        // It carries no information — the real out-of-band signal is that
+        // reasoning_content is empty — and left in place the TTS reads it aloud.
+        // Stripped on the way in so `full` never contains it and the `spoken` offsets
+        // used for sentence chunking stay consistent.
+        const piece = delta.content.replace(/<\/?think>/gi, "");
+        if (!piece) continue;
         if (thinkNote) { thinkNote.remove(); thinkNote = null; }
         if (!bubble) { bubble = add("ai", ""); setStatus("speaking…"); }
-        full += delta.content;
+        full += piece;
+        full = full.replace(/^\s+/, "");
         bubble.textContent = full;
         logEl.scrollTop = logEl.scrollHeight;
 
