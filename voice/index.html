@@ -665,6 +665,16 @@ async function handleAudio(blob) {
   }
 }
 
+// Chunking thresholds. These live beside the splitter that uses them; an earlier
+// revision kept them with the audio pipeline and a rewrite of that section took
+// them out from under the chunker.
+//
+// MIN_CHUNK: characters to accumulate before dispatching, so phrasing carries
+// across a sentence boundary instead of every sentence being its own utterance.
+// FIRST_CHUNK: lower floor for the opening chunk so speech starts promptly.
+const MIN_CHUNK = 90;
+const FIRST_CHUNK = 45;
+
 // Splits the stream on sentence boundaries so TTS can start early.
 function cutSentences(buf) {
   const out = [];
