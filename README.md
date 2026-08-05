@@ -45,6 +45,14 @@ speech/                     STT + TTS — GPU only
   deployment.yaml           speaches (faster-whisper + Kokoro)
   service.yaml              ClusterIP :8000
   tailscale-service.yaml    tailnet exposure
+voice/                      browser UI, HTTPS
+  namespace.yaml
+  kustomization.yaml        pins namespace: voice
+  index.html                the app (vanilla JS, no build step)
+  nginx.conf                serves the page, proxies /v1/* same-origin
+  deployment.yaml           nginx
+  service.yaml              ClusterIP :80
+  ingress.yaml              tailscale Ingress, TLS
 ```
 
 Each stack pins its own namespace in its own `kustomization.yaml`. The root kustomization
@@ -115,3 +123,32 @@ Dual-socket-class desktop, 8 memory channels at DDR4-2933, no GPU:
 Answer quality at `IQ2` holds up — reasoning traces are coherent and on-topic. Tool and
 structured-output reliability is the capability most likely to degrade at this
 quantisation and is worth testing against your own workload before depending on it.
+
+## Voice UI
+
+A push-to-talk page: tap the mic, speak, and the transcript goes to the LLM whose reply is
+streamed back and spoken sentence-by-sentence as it generates. Vanilla JS, no build step.
+
+**HTTPS is mandatory, not cosmetic.** `getUserMedia()` is refused outside a secure context
+by every modern browser, so a plain-HTTP page cannot access the microphone at all. Chromium
+normally offers `chrome://flags/#unsafely-treat-insecure-origin-as-secure` as an escape
+hatch, but **GrapheneOS's Vanadium removes the `chrome://flags` UI entirely**, so there is
+no override available there. The tailscale Ingress terminates TLS with a real Let's Encrypt
+certificate for the `*.ts.net` name, which also avoids asking users to trust a private CA —
+painful on a hardened Android.
+
+Everything is served from one origin. The browser never talks to speaches or llama.cpp
+directly; nginx proxies `/v1/audio/*` and `/v1/chat/*`. Neither backend sends CORS headers
+(speaches ships `allow_origins=None`), so cross-origin calls would simply fail.
+
+Two details that are easy to get wrong:
+
+- **`proxy_buffering off`** on the LLM location. With buffering on, nginx accumulates the
+  SSE stream and releases it in one lump at the end, which silently defeats sentence-chunked
+  streaming — the reply would arrive complete, then be spoken all at once.
+- **Playback goes through WebAudio, not `<audio>.play()`.** Android blocks programmatic
+  playback outside a user gesture; the `AudioContext` is created and resumed inside the mic
+  tap handler and stays usable afterwards.
+
+The thinking toggle maps to `chat_template_kwargs.thinking` per request, so voice and text
+sessions can differ without redeploying anything.

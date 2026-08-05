@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: voice-ui
+  labels:
+    app.kubernetes.io/name: voice-ui
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: voice-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

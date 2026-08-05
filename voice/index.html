@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111418">
+<title>Voice</title>
+<style>
+  :root { --bg:#111418; --panel:#1a1f26; --fg:#e8edf4; --dim:#8b97a8; --accent:#4b9fff; --rec:#ff4b5c; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+  header { padding: 12px 16px; border-bottom: 1px solid #262d36; display: flex; align-items: center; gap: 12px; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  #status { font-size: 13px; color: var(--dim); margin-left: auto; text-align: right; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 90%; padding: 10px 13px; border-radius: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  .me { align-self: flex-end; background: #2a3a52; border-bottom-right-radius: 4px; }
+  .ai { align-self: flex-start; background: var(--panel); border-bottom-left-radius: 4px; }
+  .err { align-self: stretch; background: #3a1f24; color: #ffb3bb; font-size: 14px; border-radius: 10px; }
+  .think { align-self: flex-start; color: var(--dim); font-size: 13px; font-style: italic; }
+  footer { padding: 14px 16px calc(18px + env(safe-area-inset-bottom)); border-top: 1px solid #262d36; display: flex; align-items: center; gap: 14px; }
+  #mic {
+    width: 68px; height: 68px; border-radius: 50%; border: none; flex: none;
+    background: var(--accent); color: #fff; font-size: 27px; cursor: pointer;
+    display: grid; place-items: center; transition: background .15s, transform .1s;
+  }
+  #mic:active { transform: scale(.94); }
+  #mic.rec { background: var(--rec); animation: pulse 1.3s ease-in-out infinite; }
+  #mic:disabled { background: #39424e; color: #7e8896; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,75,92,.55); } 50% { box-shadow: 0 0 0 15px rgba(255,75,92,0); } }
+  .opts { display: flex; flex-direction: column; gap: 7px; font-size: 14px; color: var(--dim); }
+  .opts label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Voice</h1>
+  <div id="status">idle</div>
+</header>
+<div id="log"></div>
+<footer>
+  <button id="mic" aria-label="Record">&#127908;</button>
+  <div class="opts">
+    <label><input type="checkbox" id="thinking" checked> Thinking (slower, better)</label>
+    <label><input type="checkbox" id="speak" checked> Speak replies</label>
+  </div>
+</footer>
+
+<script>
+// Same-origin: nginx serves this page AND proxies /v1/* to speaches and llama.cpp,
+// so there is no CORS to configure and one HTTPS cert covers everything.
+const STT_MODEL = "deepdml/faster-whisper-large-v3-turbo-ct2";
+const TTS_MODEL = "speaches-ai/Kokoro-82M-v1.0-ONNX";
+const VOICE = "af_heart";
+
+const logEl = document.getElementById("log");
+const micEl = document.getElementById("mic");
+const statusEl = document.getElementById("status");
+const thinkEl = document.getElementById("thinking");
+const speakEl = document.getElementById("speak");
+
+let recorder = null, chunks = [], recording = false, busy = false;
+let audioCtx = null;
+const history = [];
+
+function setStatus(t) { statusEl.textContent = t; }
+function add(cls, text) {
+  const d = document.createElement("div");
+  d.className = "msg " + cls;
+  d.textContent = text;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+  return d;
+}
+
+// ---- audio playback queue -------------------------------------------------
+// Sentences are synthesised as they arrive and played strictly in order, so
+// speech starts long before the model has finished generating.
+const queue = [];
+let playing = false;
+
+async function enqueue(text) {
+  if (!speakEl.checked || !text.trim()) return;
+  queue.push(text.trim());
+  if (!playing) drain();
+}
+
+async function drain() {
+  playing = true;
+  while (queue.length) {
+    const text = queue.shift();
+    try {
+      const r = await fetch("/v1/audio/speech", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: TTS_MODEL, input: text, voice: VOICE, response_format: "wav" })
+      });
+      if (!r.ok) throw new Error("TTS " + r.status);
+      const buf = await r.arrayBuffer();
+      await playPCM(buf);
+    } catch (e) {
+      add("err", "Speech failed: " + e.message);
+    }
+  }
+  playing = false;
+}
+
+// Decoded through WebAudio rather than <audio>, because Android blocks
+// programmatic <audio>.play() outside a user gesture; the AudioContext is
+// unlocked by the mic tap and then stays usable.
+function playPCM(arrayBuffer) {
+  return new Promise((resolve, reject) => {
+    audioCtx.decodeAudioData(arrayBuffer.slice(0), (buf) => {
+      const src = audioCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(audioCtx.destination);
+      src.onended = resolve;
+      src.start();
+    }, reject);
+  });
+}
+
+// ---- recording ------------------------------------------------------------
+async function startRec() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    add("err", "Microphone unavailable. This page must be served over HTTPS — getUserMedia is blocked on plain HTTP everywhere except localhost.");
+    return;
+  }
+  // Must be created/resumed inside the tap handler for Android autoplay rules.
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    add("err", "Mic permission denied: " + e.name);
+    return;
+  }
+
+  // Android Chrome gives webm/opus; desktop Safari gives mp4. Let the browser
+  // pick and tell the server via the filename extension.
+  let mime = "";
+  for (const m of ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"]) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) { mime = m; break; }
+  }
+  recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+  chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  recorder.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    handleAudio(new Blob(chunks, { type: recorder.mimeType || "audio/webm" }));
+  };
+  recorder.start();
+  recording = true;
+  micEl.classList.add("rec");
+  setStatus("listening…");
+}
+
+function stopRec() {
+  if (recorder && recorder.state !== "inactive") recorder.stop();
+  recording = false;
+  micEl.classList.remove("rec");
+}
+
+micEl.addEventListener("click", async () => {
+  if (busy) return;
+  if (recording) stopRec(); else await startRec();
+});
+
+// ---- pipeline -------------------------------------------------------------
+async function handleAudio(blob) {
+  busy = true; micEl.disabled = true;
+  setStatus("transcribing…");
+  try {
+    const ext = (blob.type.includes("mp4") ? "mp4" : blob.type.includes("ogg") ? "ogg" : "webm");
+    const fd = new FormData();
+    fd.append("file", blob, "speech." + ext);
+    fd.append("model", STT_MODEL);
+    const r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
+    if (!r.ok) throw new Error("STT " + r.status + " " + (await r.text()).slice(0, 120));
+    const said = (await r.json()).text.trim();
+    if (!said) { setStatus("nothing heard"); return; }
+    add("me", said);
+    await ask(said);
+  } catch (e) {
+    add("err", e.message);
+  } finally {
+    busy = false; micEl.disabled = false; setStatus("idle");
+  }
+}
+
+// Splits the stream on sentence boundaries so TTS can start early.
+function cutSentences(buf) {
+  const out = [];
+  let m;
+  const re = /[^.!?]+[.!?]+["')\]]*\s*/g;
+  let last = 0;
+  while ((m = re.exec(buf)) !== null) { out.push(m[0]); last = re.lastIndex; }
+  return { done: out, rest: buf.slice(last) };
+}
+
+async function ask(text) {
+  history.push({ role: "user", content: text });
+  setStatus(thinkEl.checked ? "thinking…" : "answering…");
+
+  const body = {
+    messages: history,
+    max_tokens: 900,
+    stream: true,
+    // Per-request, so voice and text sessions can differ without redeploying.
+    // Thinking off ≈ 0.6s to first word; on ≈ 14-24s but better answers.
+    chat_template_kwargs: { thinking: thinkEl.checked }
+  };
+
+  const r = await fetch("/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error("LLM " + r.status + " " + (await r.text()).slice(0, 120));
+
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let sse = "", spoken = "", full = "";
+  let bubble = null, thinkNote = null;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    sse += dec.decode(value, { stream: true });
+    const lines = sse.split("\n");
+    sse = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const p = line.slice(5).trim();
+      if (p === "[DONE]") continue;
+      let d; try { d = JSON.parse(p); } catch { continue; }
+      const delta = (d.choices && d.choices[0] && d.choices[0].delta) || {};
+
+      if (delta.reasoning_content && !thinkNote && !full) {
+        thinkNote = add("think", "thinking…");
+      }
+      if (delta.content) {
+        if (thinkNote) { thinkNote.remove(); thinkNote = null; }
+        if (!bubble) { bubble = add("ai", ""); setStatus("speaking…"); }
+        full += delta.content;
+        bubble.textContent = full;
+        logEl.scrollTop = logEl.scrollHeight;
+
+        const pending = full.slice(spoken.length);
+        const { done: sentences, rest } = cutSentences(pending);
+        if (sentences.length) {
+          const chunk = sentences.join("");
+          spoken += chunk;
+          enqueue(chunk);
+        }
+      }
+    }
+  }
+
+  // Anything after the last sentence terminator.
+  const tail = full.slice(spoken.length).trim();
+  if (tail) enqueue(tail);
+  if (full) history.push({ role: "assistant", content: full });
+  if (!full) add("err", "Model returned no speakable content (it may have spent the whole budget thinking).");
+}
+
+// Surface the HTTPS requirement immediately rather than on first tap.
+if (!window.isSecureContext) {
+  add("err", "Not a secure context — the microphone will not work. Use the https:// address.");
+}
+</script>
+</body>
+</html>

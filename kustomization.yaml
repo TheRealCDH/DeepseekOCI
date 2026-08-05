@@ -1,10 +1,15 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Two independent stacks, each pinning its own namespace in its own kustomization.
+# Independent stacks, each pinning its own namespace in its own kustomization:
+#   deepseek  the LLM, CPU only
+#   speech    STT + TTS, on the 1070 Ti
+#   voice     browser UI + same-origin proxy for the two above, HTTPS via tailscale
+#
 # The `namespace:` transformer used to live here, which forced EVERY resource into
 # `deepseek` — fine while this repo held one workload, but it would have silently
-# dragged the speech stack in with it.
+# dragged the later stacks in with it.
 resources:
   - deepseek
   - speech
+  - voice
