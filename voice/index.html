@@ -236,8 +236,12 @@ function synth(text) {
 
 async function enqueue(text) {
   if (!speakEl.checked || !text.trim()) return;
-  // Kick the request off IMMEDIATELY rather than when its turn comes.
-  slots.push(synth(text.trim()));
+  // Kick the request off IMMEDIATELY rather than when its turn comes, and trim it
+  // as part of the same chain. Trimming used to run in the play loop, i.e. only
+  // AFTER the previous clip had finished — decode plus re-encode of a several
+  // second clip sat squarely in the gap between sentences. Doing it here overlaps
+  // it with playback of the clip before.
+  slots.push(synth(text.trim()).then(trimSilence));
   if (!playing) play();
 }
 
@@ -247,7 +251,7 @@ async function play() {
   while (slots.length && myGen === gen) {
     const slot = slots.shift();
     try {
-      const buf = await trimSilence(await slot);
+      const buf = await slot;            // already synthesised and trimmed
       if (myGen !== gen) break;          // stopped while this clip was synthesising
       await playPCM(buf);
     } catch (e) {
@@ -272,15 +276,19 @@ async function play() {
 // that follows it. Trimming the dead air at both ends also butts the sentences
 // up against each other, which is what makes it read fluidly rather than as a
 // sequence of separate utterances.
+// One shared context for decoding. Constructing an AudioContext per clip is
+// expensive and, on the old critical path, that cost landed in the inter-sentence
+// gap too.
+let decodeCtx = null;
 async function trimSilence(arrayBuffer) {
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!decodeCtx) decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const ctx = decodeCtx;
     const buf = await ctx.decodeAudioData(arrayBuffer.slice(0));
     const d = buf.getChannelData(0);
     const sr = buf.sampleRate;
     let peak = 0;
     for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a; }
-    ctx.close();
     if (!peak) return arrayBuffer;
 
     // 4% of peak: above room tone and the soft breath, below any real phoneme.
@@ -757,7 +765,10 @@ async function ask(text) {
           // a separate synthesis with its own onset, so "Yes." "Sure." "OK." as
           // three requests sounds far more disjointed than one. Anything past the
           // threshold, or the tail at end of stream, goes immediately.
-          if (chunk.length >= MIN_CHUNK || !rest) {
+          // The FIRST chunk goes out as soon as a sentence completes so speech
+          // starts promptly; later chunks wait for MIN_CHUNK so phrasing stays
+          // fluid. Waiting for 90 chars on the first one just delays the opening.
+          if (!spoken || chunk.length >= MIN_CHUNK || !rest) {
             spoken += chunk;
             enqueue(chunk);
           }
