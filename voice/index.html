@@ -215,7 +215,10 @@ let gen = 0;
 // Resolver for the clip currently playing, so stopAll can complete the promise a
 // paused <audio> would otherwise never settle (pause does not fire onended).
 let currentResolve = null;
-const MAX_INFLIGHT = 3;   // matches the server's --max-batch
+// 2 = one clip playing while the next synthesises. Higher values only batch on
+// the GPU and delay the first word; synthesis already runs ~3.6x realtime, so one
+// clip of lookahead is enough to keep playback gapless.
+const MAX_INFLIGHT = 2;
 // Minimum characters before a chunk is sent for synthesis. Larger chunks mean
 // fewer utterance onsets and more natural phrasing across a sentence boundary;
 // too large and the first audio is slow to arrive. ~90 chars is roughly one
@@ -234,14 +237,28 @@ function synth(text) {
   });
 }
 
+// Texts waiting for a synthesis slot. MAX_INFLIGHT was previously declared but
+// never enforced, so every chunk fired at once; with the server's --max-batch 4
+// they all batched together and each took ~3x longer, tripling time-to-first-word.
+// Throughput was fine, latency was terrible — exactly the wrong trade for speech.
+const pendingText = [];
+let inflight = 0;
+
+function pump() {
+  while (inflight < MAX_INFLIGHT && pendingText.length) {
+    const text = pendingText.shift();
+    inflight++;
+    // Pushed in dispatch order, so slots stay in speaking order.
+    slots.push(
+      synth(text).then(trimSilence).finally(() => { inflight--; pump(); })
+    );
+  }
+}
+
 async function enqueue(text) {
   if (!speakEl.checked || !text.trim()) return;
-  // Kick the request off IMMEDIATELY rather than when its turn comes, and trim it
-  // as part of the same chain. Trimming used to run in the play loop, i.e. only
-  // AFTER the previous clip had finished — decode plus re-encode of a several
-  // second clip sat squarely in the gap between sentences. Doing it here overlaps
-  // it with playback of the clip before.
-  slots.push(synth(text.trim()).then(trimSilence));
+  pendingText.push(text.trim());
+  pump();
   if (!playing) play();
 }
 
@@ -443,6 +460,7 @@ function stopAll() {
   gen++;                                 // orphan any running play loop
   if (abortCtl) { abortCtl.abort(); abortCtl = null; }
   slots.length = 0;                      // drop pending synthesis
+  pendingText.length = 0;                // and anything not yet dispatched
   if (nowPlaying) {
     try { nowPlaying.pause ? nowPlaying.pause() : nowPlaying.stop(); } catch {}
     nowPlaying = null;
