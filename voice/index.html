@@ -286,13 +286,21 @@ async function play() {
 // chipmunk effect; AudioBufferSourceNode.playbackRate would shift pitch instead. The
 // AudioContext is still created on the first user gesture and kept as a fallback,
 // since it is the path already proven to satisfy Android's autoplay policy.
-// Strip near-silence and the breathy onset artifact from both ends of a clip.
+// Tighten a clip: trim both ends, and shorten the long pauses the model leaves
+// at sentence boundaries INSIDE the clip.
 //
-// Every sentence is synthesised as its own request, so any per-utterance onset
-// is heard on EVERY sentence — that is the "unh" before each one, and the pause
-// that follows it. Trimming the dead air at both ends also butts the sentences
-// up against each other, which is what makes it read fluidly rather than as a
-// sequence of separate utterances.
+// Measured on a 10.80s four-sentence clip: 0.40s / 0.36s / 0.34s of silence at
+// the internal sentence boundaries plus dead air at both ends — 2.10s total, 19%
+// of the audio. That is where the "lengthy pause between sentences" comes from.
+// It is not the pipeline: a full replay of the client with timestamps showed
+// 0.00s of dead air between clips. The model simply phrases with long gaps, and
+// several sentences usually land in one synthesis request, so no amount of
+// scheduling can remove them — they have to be edited out of the samples.
+//
+// Pauses are shortened, not deleted. Speech with no gap at all between sentences
+// sounds rushed and unnatural, so anything longer than MAX_GAP is clamped to it.
+const MAX_GAP = 0.16;   // seconds of silence permitted mid-clip
+
 // One shared context for decoding. Constructing an AudioContext per clip is
 // expensive and, on the old critical path, that cost landed in the inter-sentence
 // gap too.
@@ -313,14 +321,34 @@ async function trimSilence(arrayBuffer) {
     let a = 0, b = d.length - 1;
     while (a < d.length && Math.abs(d[a]) < thr) a++;
     while (b > a && Math.abs(d[b]) < thr) b--;
-    // Keep a short lead-in so the first consonant is not clipped.
-    a = Math.max(0, a - Math.floor(sr * 0.02));
+    a = Math.max(0, a - Math.floor(sr * 0.02));   // keep a lead-in so the first consonant survives
     b = Math.min(d.length - 1, b + Math.floor(sr * 0.03));
     if (b - a < sr * 0.05) return arrayBuffer;
 
-    const out = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, b - a, sr);
-    const nb = out.createBuffer(1, b - a, sr);
-    nb.copyToChannel(d.subarray(a, b), 0);
+    // Walk the trimmed region, copying audio through but clamping any silent run
+    // longer than MAX_GAP. Runs are measured on 10ms frames so a single quiet
+    // sample inside a word cannot split it.
+    const maxGap = Math.floor(sr * MAX_GAP);
+    const frame = Math.max(1, Math.floor(sr * 0.01));
+    const out = new Float32Array(b - a);
+    let w = 0, i = a, run = 0;
+    while (i <= b) {
+      const end = Math.min(i + frame, b + 1);
+      let amp = 0;
+      for (let k = i; k < end; k++) { const v = Math.abs(d[k]); if (v > amp) amp = v; }
+      if (amp < thr) {
+        run += end - i;
+        if (run <= maxGap) for (let k = i; k < end; k++) out[w++] = d[k];
+      } else {
+        run = 0;
+        for (let k = i; k < end; k++) out[w++] = d[k];
+      }
+      i = end;
+    }
+    if (w < sr * 0.05) return arrayBuffer;
+
+    const nb = ctx.createBuffer(1, w, sr);
+    nb.copyToChannel(out.subarray(0, w), 0);
     return encodeWavAt(nb, sr);
   } catch {
     return arrayBuffer;   // never let cosmetics break playback
