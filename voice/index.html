@@ -35,6 +35,7 @@
   #send:disabled { background: #39424e; color: #7e8896; }
   #stop { flex: none; width: 52px; height: 52px; border-radius: 50%; border: none;
           background: var(--rec); color: #fff; font-size: 17px; cursor: pointer; }
+  .clonebtns { display: flex; gap: 6px; }
   .ghost { background: transparent; color: var(--accent); border: 1px solid #333c48;
            border-radius: 8px; padding: 5px 9px; font-size: 13px; cursor: pointer; }
   #mic {
@@ -83,7 +84,11 @@
       <input id="speed" type="range" min="1" max="1.6" step="0.05" value="1.15">
       <span id="speedval">1.15x</span>
     </label>
-    <button id="clone" type="button" class="ghost">Clone a voice</button>
+    <span class="clonebtns">
+      <button id="clone" type="button" class="ghost">Clone: mic</button>
+      <button id="clonefilebtn" type="button" class="ghost">Clone: file</button>
+    </span>
+    <input id="clonefile" type="file" accept="audio/*,video/*" hidden>
   </div>
   </div>
 </footer>
@@ -167,7 +172,7 @@ async function loadVoices() {
   }
 }
 engineEl.addEventListener("change", loadVoices);
-loadVoices();
+loadVoices().then(() => restoreVoices().catch(() => {}));
 
 let recorder = null, chunks = [], recording = false, busy = false;
 let audioCtx = null;
@@ -415,6 +420,102 @@ function b64(arrayBuffer) {
   return btoa(out);
 }
 
+// --- persistence -----------------------------------------------------------
+// The server keeps its cloned-voice registry in memory (g_voices in
+// tts-server.cpp, no save/load), so every pod restart or Flux redeploy wipes it.
+// Reference clips are therefore kept in IndexedDB — chosen over localStorage,
+// which is ~5 MB and string-only, while a clip is a few hundred KB blob — and
+// re-registered automatically on load.
+//
+// This makes voices durable PER BROWSER. They do not follow you to another
+// device; the server has no endpoint to upload a clip to disk, so there is
+// nowhere shared to put them without changing qwentts itself.
+const DB_NAME = "voiceclones";
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(DB_NAME, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("clips", { keyPath: "name" });
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function saveClip(name, wavBuf, refText) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("clips", "readwrite");
+    tx.objectStore("clips").put({ name, wav: wavBuf, ref_text: refText });
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+async function allClips() {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const rq = db.transaction("clips").objectStore("clips").getAll();
+    rq.onsuccess = () => res(rq.result || []);
+    rq.onerror = () => rej(rq.error);
+  });
+}
+
+async function registerClip(name, wavBuf, refText) {
+  const r = await fetch("/v1/audio/voices", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, ref_text: refText || "", wav_b64: b64(wavBuf) })
+  });
+  if (!r.ok) throw new Error("register " + r.status + " " + (await r.text()).slice(0, 140));
+}
+
+// Re-push anything the server has forgotten. Runs on load, quietly.
+async function restoreVoices() {
+  let stored = [];
+  try { stored = await allClips(); } catch { return; }
+  if (!stored.length) return;
+  let have = new Set();
+  try {
+    const d = await (await fetch(ENGINES.qwen.voicesUrl)).json();
+    have = new Set((d.voices || []).map((v) => v.name));
+  } catch {}
+  let restored = 0;
+  for (const c of stored) {
+    if (have.has(c.name)) continue;
+    try { await registerClip(c.name, c.wav, c.ref_text); restored++; } catch {}
+  }
+  if (restored) add("think", "Restored " + restored + " saved voice(s) after a server restart.");
+  await loadVoices();
+}
+
+// --- cloning ---------------------------------------------------------------
+async function transcribe(blob, filename) {
+  try {
+    const fd = new FormData();
+    fd.append("file", blob, filename);
+    fd.append("model", STT_MODEL);
+    const tr = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
+    if (tr.ok) return ((await tr.json()).text || "").trim();
+  } catch {}
+  return "";
+}
+
+async function finishClone(name, blob, filename) {
+  setStatus("registering voice…");
+  try {
+    // ref_text switches the server to ICL clone mode, which is better than
+    // x-vector only, so it is worth a Whisper pass first.
+    const refText = await transcribe(blob, filename);
+    const wav = await toWav24k(blob);
+    await registerClip(name, wav, refText);
+    await saveClip(name, wav, refText);
+    add("think", "Voice '" + name + "' registered and saved" +
+        (refText ? " (heard: " + refText.slice(0, 60) + ")" : ""));
+    await loadVoices();
+    voiceEl.value = name;
+  } catch (e) {
+    add("err", "Clone failed: " + e.message);
+  } finally {
+    setStatus("idle");
+  }
+}
+
 async function cloneVoice() {
   const name = (prompt("Name for the cloned voice (letters/numbers):") || "").trim();
   if (!name) return;
@@ -436,37 +537,25 @@ async function cloneVoice() {
   rec.stop();
   await done;
   stream.getTracks().forEach((t) => t.stop());
-
-  setStatus("registering voice…");
-  try {
-    const blob = new Blob(parts, { type: rec.mimeType || "audio/webm" });
-
-    // Transcript via Whisper — optional for the server, but it enables ICL clone mode.
-    let refText = "";
-    try {
-      const fd = new FormData();
-      fd.append("file", blob, "ref.webm");
-      fd.append("model", STT_MODEL);
-      const tr = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
-      if (tr.ok) refText = ((await tr.json()).text || "").trim();
-    } catch {}
-
-    const wav = await toWav24k(blob);
-    const r = await fetch("/v1/audio/voices", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, ref_text: refText, wav_b64: b64(wav) })
-    });
-    if (!r.ok) throw new Error("register " + r.status + " " + (await r.text()).slice(0, 140));
-    add("think", "Voice '" + name + "' registered" + (refText ? " (transcript: " + refText.slice(0, 60) + ")" : ""));
-    await loadVoices();
-    voiceEl.value = name;
-  } catch (e) {
-    add("err", "Clone failed: " + e.message);
-  } finally {
-    setStatus("idle");
-  }
+  await finishClone(name, new Blob(parts, { type: rec.mimeType || "audio/webm" }), "ref.webm");
 }
+
+// Clone from an existing recording instead of the mic. decodeAudioData handles
+// whatever the browser can decode — wav, mp3, m4a, ogg, even a video's audio track.
+const cloneFileEl = document.getElementById("clonefile");
+document.getElementById("clonefilebtn").addEventListener("click", () => {
+  if (!busy) cloneFileEl.click();
+});
+cloneFileEl.addEventListener("change", async () => {
+  const f = cloneFileEl.files && cloneFileEl.files[0];
+  cloneFileEl.value = "";
+  if (!f) return;
+  const name = (prompt("Name for the cloned voice (letters/numbers):") || "").trim();
+  if (!name) return;
+  add("think", "Encoding " + f.name + "…");
+  await finishClone(name, f, f.name);
+});
+
 document.getElementById("clone").addEventListener("click", () => { if (!busy) cloneVoice(); });
 
 // ---- pipeline -------------------------------------------------------------
