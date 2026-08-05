@@ -124,6 +124,12 @@ const ENGINES = {
       repetition_penalty: 1.1,
       temperature: 0.7,
       top_p: 0.9,
+      // Hard ceiling on generation. Without it a badly-conditioned clone can run
+      // away: a nine-word sentence once produced 163 SECONDS of continuous audio
+      // rather than ~3. The codec runs at 12 Hz and speech is roughly 15 chars a
+      // second, so this allows about 2x the expected length plus headroom, which
+      // caps the damage at a few seconds instead of minutes.
+      max_new_tokens: Math.ceil((t.length / 15) * 12 * 2) + 60,
     }),
   },
   kokoro: {
@@ -202,6 +208,11 @@ const slots = [];
 let fetching = 0;
 let playing = false;
 const MAX_INFLIGHT = 3;   // matches the server's --max-batch
+// Minimum characters before a chunk is sent for synthesis. Larger chunks mean
+// fewer utterance onsets and more natural phrasing across a sentence boundary;
+// too large and the first audio is slow to arrive. ~90 chars is roughly one
+// full sentence.
+const MIN_CHUNK = 90;
 
 function synth(text) {
   const eng = ENGINES[engineEl.value] || ENGINES.qwen;
@@ -227,7 +238,7 @@ async function play() {
   while (slots.length) {
     const slot = slots.shift();
     try {
-      await playPCM(await slot);
+      await playPCM(await trimSilence(await slot));
     } catch (e) {
       add("err", "Speech failed: " + e.message);
     }
@@ -242,6 +253,43 @@ async function play() {
 // chipmunk effect; AudioBufferSourceNode.playbackRate would shift pitch instead. The
 // AudioContext is still created on the first user gesture and kept as a fallback,
 // since it is the path already proven to satisfy Android's autoplay policy.
+// Strip near-silence and the breathy onset artifact from both ends of a clip.
+//
+// Every sentence is synthesised as its own request, so any per-utterance onset
+// is heard on EVERY sentence — that is the "unh" before each one, and the pause
+// that follows it. Trimming the dead air at both ends also butts the sentences
+// up against each other, which is what makes it read fluidly rather than as a
+// sequence of separate utterances.
+async function trimSilence(arrayBuffer) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const buf = await ctx.decodeAudioData(arrayBuffer.slice(0));
+    const d = buf.getChannelData(0);
+    const sr = buf.sampleRate;
+    let peak = 0;
+    for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a; }
+    ctx.close();
+    if (!peak) return arrayBuffer;
+
+    // 4% of peak: above room tone and the soft breath, below any real phoneme.
+    const thr = peak * 0.04;
+    let a = 0, b = d.length - 1;
+    while (a < d.length && Math.abs(d[a]) < thr) a++;
+    while (b > a && Math.abs(d[b]) < thr) b--;
+    // Keep a short lead-in so the first consonant is not clipped.
+    a = Math.max(0, a - Math.floor(sr * 0.02));
+    b = Math.min(d.length - 1, b + Math.floor(sr * 0.03));
+    if (b - a < sr * 0.05) return arrayBuffer;
+
+    const out = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, b - a, sr);
+    const nb = out.createBuffer(1, b - a, sr);
+    nb.copyToChannel(d.subarray(a, b), 0);
+    return encodeWavAt(nb, sr);
+  } catch {
+    return arrayBuffer;   // never let cosmetics break playback
+  }
+}
+
 function playPCM(arrayBuffer) {
   const rate = +speedEl.value || 1;
   return new Promise((resolve) => {
@@ -378,7 +426,9 @@ stopEl.addEventListener("click", stopAll);
 // client-side qwen-codec step is needed. MediaRecorder gives webm/opus though, so
 // the clip is re-rendered to 24 kHz mono WAV first. The transcript is filled in
 // by Whisper because supplying ref_text enables the better ICL clone mode.
-function encodeWav(audioBuffer) {
+function encodeWav(audioBuffer) { return encodeWavAt(audioBuffer, 24000); }
+
+function encodeWavAt(audioBuffer, sampleRate) {
   const n = audioBuffer.length;
   const data = audioBuffer.getChannelData(0);
   const buf = new ArrayBuffer(44 + n * 2);
@@ -386,7 +436,7 @@ function encodeWav(audioBuffer) {
   const wr = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
   wr(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); wr(8, "WAVEfmt ");
   v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, 24000, true); v.setUint32(28, 24000 * 2, true);
+  v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
   v.setUint16(32, 2, true); v.setUint16(34, 16, true);
   wr(36, "data"); v.setUint32(40, n * 2, true);
   for (let i = 0; i < n; i++) {
@@ -661,8 +711,14 @@ async function ask(text) {
         const { done: sentences, rest } = cutSentences(pending);
         if (sentences.length) {
           const chunk = sentences.join("");
-          spoken += chunk;
-          enqueue(chunk);
+          // Hold back very short fragments and let them accumulate. Each chunk is
+          // a separate synthesis with its own onset, so "Yes." "Sure." "OK." as
+          // three requests sounds far more disjointed than one. Anything past the
+          // threshold, or the tail at end of stream, goes immediately.
+          if (chunk.length >= MIN_CHUNK || !rest) {
+            spoken += chunk;
+            enqueue(chunk);
+          }
         }
       }
     }
