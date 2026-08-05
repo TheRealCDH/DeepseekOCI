@@ -37,6 +37,8 @@
   .opts { display: flex; flex-direction: column; gap: 7px; font-size: 14px; color: var(--dim); }
   .opts label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
   input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--accent); }
+  select { background: var(--panel); color: var(--fg); border: 1px solid #333c48;
+           border-radius: 7px; padding: 3px 6px; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -50,6 +52,12 @@
   <div class="opts">
     <label><input type="checkbox" id="thinking" checked> Thinking (slower, better)</label>
     <label><input type="checkbox" id="speak" checked> Speak replies</label>
+    <label>Voice
+      <select id="engine">
+        <option value="qwen" selected>Qwen3 (cloning)</option>
+        <option value="kokoro">Kokoro (faster)</option>
+      </select>
+    </label>
   </div>
 </footer>
 
@@ -57,14 +65,39 @@
 // Same-origin: nginx serves this page AND proxies /v1/* to speaches and llama.cpp,
 // so there is no CORS to configure and one HTTPS cert covers everything.
 const STT_MODEL = "deepdml/faster-whisper-large-v3-turbo-ct2";
-const TTS_MODEL = "speaches-ai/Kokoro-82M-v1.0-ONNX";
-const VOICE = "af_heart";
+
+// Two TTS engines on two different GPUs, so they never contend:
+//   qwen   -> qwentts.cpp / Qwen3-TTS on the AMD RX 6650 XT. 3.6x realtime, and the
+//             only one that can clone a voice. DEFAULT.
+//   kokoro -> Kokoro via speaches on the GTX 1070 Ti. Faster (7.7x) but a fixed voice
+//             set and no cloning. Kept as a fallback, including for when the AMD is
+//             busy transcoding.
+// Payload shapes differ: qwentts infers the model from its --alias and takes a bare
+// speaker name; speaches needs an explicit model id and a Kokoro voice id.
+const ENGINES = {
+  qwen: {
+    label: "Qwen3",
+    url: "/v1/audio/speech",
+    body: (t) => ({ input: t, voice: "ryan", response_format: "wav" }),
+  },
+  kokoro: {
+    label: "Kokoro",
+    url: "/kokoro/v1/audio/speech",
+    body: (t) => ({
+      model: "speaches-ai/Kokoro-82M-v1.0-ONNX",
+      input: t,
+      voice: "af_heart",
+      response_format: "wav",
+    }),
+  },
+};
 
 const logEl = document.getElementById("log");
 const micEl = document.getElementById("mic");
 const statusEl = document.getElementById("status");
 const thinkEl = document.getElementById("thinking");
 const speakEl = document.getElementById("speak");
+const engineEl = document.getElementById("engine");
 
 let recorder = null, chunks = [], recording = false, busy = false;
 let audioCtx = null;
@@ -97,12 +130,13 @@ async function drain() {
   while (queue.length) {
     const text = queue.shift();
     try {
-      const r = await fetch("/v1/audio/speech", {
+      const eng = ENGINES[engineEl.value] || ENGINES.qwen;
+      const r = await fetch(eng.url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: TTS_MODEL, input: text, voice: VOICE, response_format: "wav" })
+        body: JSON.stringify(eng.body(text))
       });
-      if (!r.ok) throw new Error("TTS " + r.status);
+      if (!r.ok) throw new Error(eng.label + " TTS " + r.status);
       const buf = await r.arrayBuffer();
       await playPCM(buf);
     } catch (e) {

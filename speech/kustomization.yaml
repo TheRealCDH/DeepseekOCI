@@ -8,6 +8,8 @@ resources:
   - deployment.yaml
   - service.yaml
   - tailscale-service.yaml
+  - qwentts-deployment.yaml
+  - qwentts-service.yaml
 
 labels:
   - pairs:

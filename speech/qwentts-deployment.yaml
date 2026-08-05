@@ -1,0 +1,89 @@
+# qwentts.cpp — Qwen3-TTS with zero-shot voice cloning, on the AMD RX 6650 XT.
+#
+# WHY THE AMD AND NOT THE 1070 Ti: measured 2026-08-05 with identical text and voice —
+#   GTX 1070 Ti (Vulkan): 7.94s for 4.56s of audio = 0.57x realtime (slower than speech)
+#   RX 6650 XT (Vulkan):  1.30s for 4.64s of audio = 3.6x realtime
+# ~6x apart, and ggml reports why: Pascal advertises "fp16: 0" to Vulkan while RDNA2
+# advertises "fp16: dot2". Running this on the NVIDIA would have been the wrong call.
+#
+# This ALSO leaves the 1070 Ti entirely to Whisper + Kokoro, so no GPU time-slicing of
+# nvidia.com/gpu is needed — the two speech engines sit on separate cards.
+#
+# WHY NOT ROCm: not installed, and AMD does not officially support gfx1032. Vulkan needs
+# none of it — mesa/RADV is already present for Jellyfin's VAAPI.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwentts
+  labels:
+    app.kubernetes.io/name: qwentts
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qwentts
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qwentts
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ripnix
+      containers:
+        - name: qwentts
+          # Built locally by nix (dockerTools) from /etc/nixos/qwentts-image.nix and
+          # imported with `k3s ctr images import`. It exists in no registry, so the pull
+          # policy MUST be Never or the kubelet will try to fetch it and fail ImagePullBackOff.
+          image: docker.io/library/qwentts:vulkan
+          imagePullPolicy: Never
+          args:
+            - --model
+            - /models/qwen3-tts/qwen-talker-1.7b-customvoice-Q8_0.gguf
+            # customvoice, not base: this is the checkpoint that supports cloning a voice
+            # from a reference clip, which is the whole reason for running Qwen3 alongside
+            # Kokoro (Kokoro has a fixed voice set and cannot clone).
+            - --codec
+            - /models/qwen3-tts/qwen-tokenizer-12hz-Q8_0.gguf
+            - --alias
+            - qwen3-tts
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            limits:
+              # Supplied by generic-device-plugin (declared in /etc/nixos/k3s.nix), which
+              # maps to /dev/dri/renderD129. This request is what grants cgroup permission
+              # to open the node — a hostPath mount alone is not enough.
+              devic.es/dri: 1
+              memory: 8Gi
+            requests:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+              readOnly: true
+          startupProbe:
+            httpGet:
+              path: /v1/models
+              port: 8080
+            periodSeconds: 10
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /v1/models
+              port: 8080
+            periodSeconds: 60
+            timeoutSeconds: 15
+            failureThreshold: 5
+      volumes:
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory
