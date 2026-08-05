@@ -33,6 +33,10 @@
   #send { flex: none; width: 46px; border: none; border-radius: 11px; background: var(--accent);
           color: #fff; font-size: 17px; cursor: pointer; }
   #send:disabled { background: #39424e; color: #7e8896; }
+  #stop { flex: none; width: 52px; height: 52px; border-radius: 50%; border: none;
+          background: var(--rec); color: #fff; font-size: 17px; cursor: pointer; }
+  .ghost { background: transparent; color: var(--accent); border: 1px solid #333c48;
+           border-radius: 8px; padding: 5px 9px; font-size: 13px; cursor: pointer; }
   #mic {
     width: 68px; height: 68px; border-radius: 50%; border: none; flex: none;
     background: var(--accent); color: #fff; font-size: 27px; cursor: pointer;
@@ -62,6 +66,7 @@
   </form>
   <div class="row">
   <button id="mic" aria-label="Record">&#127908;</button>
+  <button id="stop" type="button" aria-label="Stop" hidden>&#9632;</button>
   <div class="opts">
     <label><input type="checkbox" id="thinking" checked> Thinking (slower, better)</label>
     <label><input type="checkbox" id="speak" checked> Speak replies</label>
@@ -78,6 +83,7 @@
       <input id="speed" type="range" min="1" max="1.6" step="0.05" value="1.15">
       <span id="speedval">1.15x</span>
     </label>
+    <button id="clone" type="button" class="ghost">Clone a voice</button>
   </div>
   </div>
 </footer>
@@ -237,7 +243,8 @@ function playPCM(arrayBuffer) {
     a.webkitPreservesPitch = true;
     a.playbackRate = rate;
     a.src = url;
-    const done = () => { URL.revokeObjectURL(url); resolve(); };
+    nowPlaying = a;
+    const done = () => { URL.revokeObjectURL(url); nowPlaying = null; resolve(); };
     a.onended = done;
     a.onerror = () => { URL.revokeObjectURL(url); playViaWebAudio(arrayBuffer, rate).then(resolve, resolve); };
     a.play().catch(() => {
@@ -333,6 +340,131 @@ micEl.addEventListener("click", async () => {
   if (recording) stopRec(); else await startRec();
 });
 
+// ---- stop -----------------------------------------------------------------
+// Cancels everything in flight: the LLM stream, any queued or in-progress
+// synthesis, and whatever is currently playing. Without this a long reply had to
+// be waited out — there was no way to interrupt it.
+const stopEl = document.getElementById("stop");
+let abortCtl = null;
+let nowPlaying = null;
+
+function stopAll() {
+  if (abortCtl) { abortCtl.abort(); abortCtl = null; }
+  slots.length = 0;                      // drop pending synthesis
+  if (nowPlaying) {
+    try { nowPlaying.pause ? nowPlaying.pause() : nowPlaying.stop(); } catch {}
+    nowPlaying = null;
+  }
+  playing = false;
+  busy = false;
+  micEl.disabled = false;
+  sendEl.disabled = false;
+  stopEl.hidden = true;
+  setStatus("stopped");
+}
+stopEl.addEventListener("click", stopAll);
+
+// ---- voice cloning --------------------------------------------------------
+// The server accepts a base64 WAV and extracts the speaker latents itself, so no
+// client-side qwen-codec step is needed. MediaRecorder gives webm/opus though, so
+// the clip is re-rendered to 24 kHz mono WAV first. The transcript is filled in
+// by Whisper because supplying ref_text enables the better ICL clone mode.
+function encodeWav(audioBuffer) {
+  const n = audioBuffer.length;
+  const data = audioBuffer.getChannelData(0);
+  const buf = new ArrayBuffer(44 + n * 2);
+  const v = new DataView(buf);
+  const wr = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+  wr(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); wr(8, "WAVEfmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, 24000, true); v.setUint32(28, 24000 * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  wr(36, "data"); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const x = Math.max(-1, Math.min(1, data[i]));
+    v.setInt16(44 + i * 2, x < 0 ? x * 0x8000 : x * 0x7fff, true);
+  }
+  return buf;
+}
+
+async function toWav24k(blob) {
+  const raw = await blob.arrayBuffer();
+  const tmp = new (window.AudioContext || window.webkitAudioContext)();
+  const decoded = await tmp.decodeAudioData(raw);
+  // Resample to mono 24 kHz, which is what the codec expects.
+  const off = new OfflineAudioContext(1, Math.ceil(decoded.duration * 24000), 24000);
+  const src = off.createBufferSource();
+  src.buffer = decoded;
+  src.connect(off.destination);
+  src.start();
+  const rendered = await off.startRendering();
+  tmp.close();
+  return encodeWav(rendered);
+}
+
+function b64(arrayBuffer) {
+  let out = "";
+  const bytes = new Uint8Array(arrayBuffer);
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    out += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(out);
+}
+
+async function cloneVoice() {
+  const name = (prompt("Name for the cloned voice (letters/numbers):") || "").trim();
+  if (!name) return;
+  add("think", "Recording 8 seconds — speak naturally…");
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") await audioCtx.resume();
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) { add("err", "Mic denied: " + e.name); return; }
+
+  const rec = new MediaRecorder(stream);
+  const parts = [];
+  rec.ondataavailable = (e) => { if (e.data.size) parts.push(e.data); };
+  const done = new Promise((res) => { rec.onstop = res; });
+  rec.start();
+  await new Promise((r) => setTimeout(r, 8000));
+  rec.stop();
+  await done;
+  stream.getTracks().forEach((t) => t.stop());
+
+  setStatus("registering voice…");
+  try {
+    const blob = new Blob(parts, { type: rec.mimeType || "audio/webm" });
+
+    // Transcript via Whisper — optional for the server, but it enables ICL clone mode.
+    let refText = "";
+    try {
+      const fd = new FormData();
+      fd.append("file", blob, "ref.webm");
+      fd.append("model", STT_MODEL);
+      const tr = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
+      if (tr.ok) refText = ((await tr.json()).text || "").trim();
+    } catch {}
+
+    const wav = await toWav24k(blob);
+    const r = await fetch("/v1/audio/voices", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, ref_text: refText, wav_b64: b64(wav) })
+    });
+    if (!r.ok) throw new Error("register " + r.status + " " + (await r.text()).slice(0, 140));
+    add("think", "Voice '" + name + "' registered" + (refText ? " (transcript: " + refText.slice(0, 60) + ")" : ""));
+    await loadVoices();
+    voiceEl.value = name;
+  } catch (e) {
+    add("err", "Clone failed: " + e.message);
+  } finally {
+    setStatus("idle");
+  }
+}
+document.getElementById("clone").addEventListener("click", () => { if (!busy) cloneVoice(); });
+
 // ---- pipeline -------------------------------------------------------------
 async function handleAudio(blob) {
   busy = true; micEl.disabled = true;
@@ -378,10 +510,13 @@ async function ask(text) {
     chat_template_kwargs: { thinking: thinkEl.checked }
   };
 
+  abortCtl = new AbortController();
+  stopEl.hidden = false;
   const r = await fetch("/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal: abortCtl.signal
   });
   if (!r.ok) throw new Error("LLM " + r.status + " " + (await r.text()).slice(0, 120));
 
@@ -427,6 +562,8 @@ async function ask(text) {
   // Anything after the last sentence terminator.
   const tail = full.slice(spoken.length).trim();
   if (tail) enqueue(tail);
+  stopEl.hidden = true;
+  abortCtl = null;
   if (full) history.push({ role: "assistant", content: full });
   if (!full) add("err", "Model returned no speakable content (it may have spent the whole budget thinking).");
 }
