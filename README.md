@@ -39,20 +39,21 @@ deepseek/                   the LLM — CPU only
   deployment.yaml           llama-server, hostPath model mount
   service.yaml              ClusterIP :8080
   tailscale-service.yaml    tailnet exposure
-speech/                     STT + TTS — GPU only
+speech/                     STT + TTS — two engines, two GPUs
   namespace.yaml
   kustomization.yaml        pins namespace: speech
-  deployment.yaml           speaches (faster-whisper + Kokoro)
+  deployment.yaml           speaches: faster-whisper + Kokoro (NVIDIA)
   service.yaml              ClusterIP :8000
   tailscale-service.yaml    tailnet exposure
+  qwentts-deployment.yaml   Qwen3-TTS, voice cloning (AMD, Vulkan)
+  qwentts-service.yaml      ClusterIP :8080
 voice/                      browser UI, HTTPS
   namespace.yaml
   kustomization.yaml        pins namespace: voice
   index.html                the app (vanilla JS, no build step)
   nginx.conf                serves the page, proxies /v1/* same-origin
   deployment.yaml           nginx
-  service.yaml              ClusterIP :80
-  ingress.yaml              tailscale Ingress, TLS
+  service.yaml              NodePort 30080 (TLS terminated on the host)
 ```
 
 Each stack pins its own namespace in its own `kustomization.yaml`. The root kustomization
@@ -133,9 +134,21 @@ streamed back and spoken sentence-by-sentence as it generates. Vanilla JS, no bu
 by every modern browser, so a plain-HTTP page cannot access the microphone at all. Chromium
 normally offers `chrome://flags/#unsafely-treat-insecure-origin-as-secure` as an escape
 hatch, but **GrapheneOS's Vanadium removes the `chrome://flags` UI entirely**, so there is
-no override available there. The tailscale Ingress terminates TLS with a real Let's Encrypt
-certificate for the `*.ts.net` name, which also avoids asking users to trust a private CA —
-painful on a hardened Android.
+no override available there.
+
+TLS is terminated by the **host's** tailscaled via `tailscale serve`, not by the Tailscale
+Kubernetes operator's Ingress. That is a throughput decision, measured on an identical
+252,972-byte audio response:
+
+| | total | speed |
+|---|---|---|
+| operator Ingress (`TS_USERSPACE`, userspace TCP + TLS) | 13.87s | 18 KB/s |
+| `tailscale serve` on the host (kernel path) | 2.14s | **118 KB/s** |
+
+6.5x, and not CPU starvation — the Ingress proxy sat at 2m CPU with no limit. Audio is the
+only thing this app moves in bulk, so that gap decides whether speech streams or stutters.
+Both paths get a real Let's Encrypt cert, so no private CA has to be trusted on the phone.
+The serve mapping is declared in `/etc/nixos/voice-serve.nix`.
 
 Everything is served from one origin. The browser never talks to speaches or llama.cpp
 directly; nginx proxies `/v1/audio/*` and `/v1/chat/*`. Neither backend sends CORS headers

@@ -1,3 +1,16 @@
+# NodePort, not plain ClusterIP: TLS is terminated by the HOST's tailscaled via
+# `tailscale serve`, which proxies to this port on 127.0.0.1. A ClusterIP would work
+# today but is not stable — it changes if the Service is ever deleted and recreated,
+# silently breaking the serve target. A pinned nodePort cannot drift.
+#
+# WHY NOT THE TAILSCALE INGRESS (removed 2026-08-05): the operator's Ingress proxy runs
+# tailscaled with TS_USERSPACE and terminates TLS inside that userspace TCP stack.
+# Measured on an identical 252,972-byte payload:
+#     operator Ingress   13.87s   18 KB/s
+#     tailscale serve     2.14s  118 KB/s
+# 6.5x, and it was not CPU starvation — the proxy sat at 2m CPU with no limit. Audio is
+# the one thing this app moves in bulk, so that gap is the difference between speech
+# that streams and speech that stutters.
 apiVersion: v1
 kind: Service
 metadata:
@@ -5,10 +18,11 @@ metadata:
   labels:
     app.kubernetes.io/name: voice-ui
 spec:
-  type: ClusterIP
+  type: NodePort
   selector:
     app.kubernetes.io/name: voice-ui
   ports:
     - name: http
       port: 80
       targetPort: 8080
+      nodePort: 30080

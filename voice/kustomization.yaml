@@ -7,7 +7,6 @@ resources:
   - namespace.yaml
   - deployment.yaml
   - service.yaml
-  - ingress.yaml
 
 # Kept as real files rather than inline YAML so the page and nginx config stay
 # diffable and editable. The generated name hash changes when either file changes,
