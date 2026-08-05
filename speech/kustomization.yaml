@@ -14,3 +14,10 @@ resources:
 labels:
   - pairs:
       app.kubernetes.io/part-of: deepseek-oci
+
+# The sidecar script is kept as a real .py file rather than inline YAML so it stays
+# diffable and lintable; the generated name hash rolls the pod when it changes.
+configMapGenerator:
+  - name: voice-store
+    files:
+      - voice-store.py

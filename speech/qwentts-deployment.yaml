@@ -57,9 +57,9 @@ spec:
             # The base checkpoint still has a usable default voice when no `voice` is
             # given, so this does not leave the deployment voiceless.
             #
-            # CAVEAT: the cloned-voice registry (g_voices in tts-server.cpp) is in-memory
-            # with no save/load, so registrations are LOST on pod restart and must be
-            # re-registered.
+            # The cloned-voice registry (g_voices in tts-server.cpp) is in-memory with
+            # no save/load, so it does NOT survive a restart on its own — the
+            # voice-store sidecar below owns the clips on disk and re-registers them.
             - --codec
             - /models/qwen3-tts/qwen-tokenizer-12hz-Q8_0.gguf
             - --alias
@@ -88,8 +88,9 @@ spec:
               memory: 2Gi
           volumeMounts:
             - name: models
+              # Not readOnly: the voice-store sidecar writes cloned clips under
+              # /models/qwen3-tts/voices on the same volume.
               mountPath: /models
-              readOnly: true
           startupProbe:
             httpGet:
               path: /v1/models
@@ -103,8 +104,47 @@ spec:
             periodSeconds: 60
             timeoutSeconds: 15
             failureThreshold: 5
+        # Sidecar: durable storage for cloned voices. tts-server keeps its registry
+        # in memory with no save/load, so without this every pod restart and every
+        # Flux redeploy wipes every cloned voice. Keeping the clips in the browser
+        # would fix restarts but not devices — a voice cloned on a phone would be
+        # invisible from a desktop. This owns them on disk and re-registers on boot.
+        #
+        # Same pod, so it reaches tts-server on 127.0.0.1 and shares /models.
+        - name: voice-store
+          image: docker.io/python:3.12-alpine
+          command: ["python3", "/app/voice-store.py"]
+          env:
+            - name: VOICE_STORE
+              value: /models/qwen3-tts/voices
+            - name: TTS_UPSTREAM
+              value: http://127.0.0.1:8080
+            - name: PORT
+              value: "8090"
+          ports:
+            - containerPort: 8090
+              name: store
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+            - name: voice-store-script
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8090
+            periodSeconds: 10
       volumes:
         - name: models
           hostPath:
             path: /models
             type: Directory
+        - name: voice-store-script
+          configMap:
+            name: voice-store

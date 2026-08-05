@@ -457,7 +457,10 @@ async function allClips() {
 }
 
 async function registerClip(name, wavBuf, refText) {
-  const r = await fetch("/v1/audio/voices", {
+  // The voice-store sidecar persists the clip on the server and forwards the
+  // registration, so the voice outlives pod restarts and is visible from every
+  // device — unlike posting straight to /v1/audio/voices, which is memory-only.
+  const r = await fetch("/voices/register", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, ref_text: refText || "", wav_b64: b64(wavBuf) })
