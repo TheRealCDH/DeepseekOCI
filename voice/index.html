@@ -195,228 +195,169 @@ function add(cls, text) {
 }
 
 // ---- audio pipeline ------------------------------------------------------
-// Synthesis and playback run CONCURRENTLY. An earlier version awaited the fetch
-// and then awaited playback in the same loop, so every sentence was preceded by
-// a 0.3-1.4s silence while the next one was synthesised, and the GPU sat idle
-// for the whole time audio was playing. Measured: the engine renders ~3.5x
-// faster than realtime, so if the next sentence is fetched while the current one
-// plays, it is always ready before it is needed and playback becomes gapless.
+// Streaming, sample-accurate playback.
 //
-// Order matters, so each sentence gets a slot holding a promise for its audio;
-// the player awaits slots in order while the fetcher runs ahead of it.
-const slots = [];
-let fetching = 0;
-let playing = false;
-// Bumped by stopAll(). A play loop captures it on entry and exits as soon as it
-// no longer matches, so a cancelled loop cannot keep pulling clips off the queue
-// alongside the loop started by the next prompt — which is what made two replies
-// play interleaved.
-let gen = 0;
-// Resolver for the clip currently playing, so stopAll can complete the promise a
-// paused <audio> would otherwise never settle (pause does not fire onended).
-let currentResolve = null;
-// 3 = one clip playing plus two synthesising ahead.
+// The previous design requested a complete WAV per sentence and stitched the
+// clips together. That is inherently bursty: nothing could play until a whole
+// clip had been synthesised, and any variance in synthesis time showed up as a
+// gap. Synthesis time does not even track audio length — there is a fixed ~1s
+// per request, so short clips cost 0.87x realtime while long ones manage 2.3x.
 //
-// One clip of lookahead was not enough because synthesis time does NOT track
-// audio length. There is a fixed ~1s cost per request, so short clips are far
-// worse than linear (measured on a cloned voice):
+// The server supports response_format "pcm", which streams raw s16le as it
+// generates. Measured: first byte in 0.4ms, full 8.48s of audio delivered in
+// 3.38s. So audio can start almost immediately and arrive continuously.
 //
-//    10 chars -> synth 1.29s for 1.12s audio = 0.87x realtime
-//    68 chars -> synth 2.44s for 4.64s audio = 1.9x
-//   152 chars -> synth 3.61s for 8.16s audio = 2.3x
-//
-// A short clip therefore buys only ~1s of playback while the next still costs
-// seconds, the queue drains, and a gap appears — which is exactly why some
-// sentences followed instantly and others stalled. Two clips of lookahead absorb
-// that variance. The first chunk is dispatched alone so it does not batch, and
-// first-word latency is unaffected.
-const MAX_INFLIGHT = 3;
-// Minimum characters before a chunk is sent for synthesis. Larger chunks mean
-// fewer utterance onsets and more natural phrasing across a sentence boundary;
-// too large and the first audio is slow to arrive. ~90 chars is roughly one
-// full sentence.
-const MIN_CHUNK = 90;
-// Floor for the opening chunk. Low enough to start speaking quickly, high enough
-// that its playback covers the synthesis of what follows.
-const FIRST_CHUNK = 45;
+// Each arriving block is scheduled on the AudioContext clock at the exact moment
+// the previous block ends, which makes playback gapless by construction rather
+// than by hoping the next clip is ready in time.
+const SR = 24000;                 // server output rate, s16le mono
+const PREBUFFER = 0.35;           // seconds of audio to accumulate before starting
 
-function synth(text) {
-  const eng = ENGINES[engineEl.value] || ENGINES.qwen;
-  return fetch(eng.url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(eng.body(text))
-  }).then((r) => {
-    if (!r.ok) throw new Error(eng.label + " TTS " + r.status);
-    return r.arrayBuffer();
-  });
+let playCtx = null;
+let nextAt = 0;                   // AudioContext time the next block should start
+let gen = 0;                      // bumped by stopAll to orphan in-flight work
+let liveSources = [];
+let speaking = false;
+
+// Text still waiting to be spoken. Chunks are queued so their audio is requested
+// in order; the scheduler keeps the output contiguous across them.
+const pendingText = [];
+let streaming = false;
+
+function ensureCtx() {
+  if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return playCtx;
 }
 
-// Texts waiting for a synthesis slot. MAX_INFLIGHT was previously declared but
-// never enforced, so every chunk fired at once; with the server's --max-batch 4
-// they all batched together and each took ~3x longer, tripling time-to-first-word.
-// Throughput was fine, latency was terrible — exactly the wrong trade for speech.
-const pendingText = [];
-let inflight = 0;
-
-function pump() {
-  while (inflight < MAX_INFLIGHT && pendingText.length) {
-    const text = pendingText.shift();
-    inflight++;
-    // Pushed in dispatch order, so slots stay in speaking order.
-    slots.push(
-      synth(text).then(trimSilence).finally(() => { inflight--; pump(); })
-    );
-  }
+function stopAll() {
+  gen++;
+  if (abortCtl) { abortCtl.abort(); abortCtl = null; }
+  pendingText.length = 0;
+  for (const s of liveSources) { try { s.stop(); } catch {} }
+  liveSources = [];
+  nextAt = 0;
+  streaming = false;
+  speaking = false;
+  busy = false;
+  micEl.disabled = false;
+  sendEl.disabled = false;
+  stopEl.hidden = true;
+  setStatus("stopped");
 }
 
 async function enqueue(text) {
   if (!speakEl.checked || !text.trim()) return;
   pendingText.push(text.trim());
-  pump();
-  if (!playing) play();
+  if (!streaming) drainText();
 }
 
-async function play() {
+async function drainText() {
+  streaming = true;
   const myGen = gen;
-  playing = true;
-  while (slots.length && myGen === gen) {
-    const slot = slots.shift();
+  while (pendingText.length && myGen === gen) {
     try {
-      const buf = await slot;            // already synthesised and trimmed
-      if (myGen !== gen) break;          // stopped while this clip was synthesising
-      await playPCM(buf);
+      await speakStream(pendingText.shift(), myGen);
     } catch (e) {
-      if (myGen !== gen) break;
-      add("err", "Speech failed: " + e.message);
+      if (myGen === gen) add("err", "Speech failed: " + e.message);
     }
   }
-  if (myGen === gen) playing = false;
+  if (myGen === gen) streaming = false;
 }
 
-// Playback. Qwen3 speaks at ~127 wpm against ~150 for normal conversation, and the
-// engine exposes no speed parameter, so the correction has to happen client side.
-//
-// An <audio> element is preferred because preservesPitch time-stretches WITHOUT the
-// chipmunk effect; AudioBufferSourceNode.playbackRate would shift pitch instead. The
-// AudioContext is still created on the first user gesture and kept as a fallback,
-// since it is the path already proven to satisfy Android's autoplay policy.
-// Tighten a clip: trim both ends, and shorten the long pauses the model leaves
-// at sentence boundaries INSIDE the clip.
-//
-// Measured on a 10.80s four-sentence clip: 0.40s / 0.36s / 0.34s of silence at
-// the internal sentence boundaries plus dead air at both ends — 2.10s total, 19%
-// of the audio. That is where the "lengthy pause between sentences" comes from.
-// It is not the pipeline: a full replay of the client with timestamps showed
-// 0.00s of dead air between clips. The model simply phrases with long gaps, and
-// several sentences usually land in one synthesis request, so no amount of
-// scheduling can remove them — they have to be edited out of the samples.
-//
-// Pauses are shortened, not deleted. Speech with no gap at all between sentences
-// sounds rushed and unnatural, so anything longer than MAX_GAP is clamped to it.
-const MAX_GAP = 0.16;   // seconds of silence permitted mid-clip
-
-// One shared context for decoding. Constructing an AudioContext per clip is
-// expensive and, on the old critical path, that cost landed in the inter-sentence
-// gap too.
-let decodeCtx = null;
-async function trimSilence(arrayBuffer) {
-  try {
-    if (!decodeCtx) decodeCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const ctx = decodeCtx;
-    const buf = await ctx.decodeAudioData(arrayBuffer.slice(0));
-    const d = buf.getChannelData(0);
-    const sr = buf.sampleRate;
-    let peak = 0;
-    for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a; }
-    if (!peak) return arrayBuffer;
-
-    // 4% of peak: above room tone and the soft breath, below any real phoneme.
-    const thr = peak * 0.04;
-    let a = 0, b = d.length - 1;
-    while (a < d.length && Math.abs(d[a]) < thr) a++;
-    while (b > a && Math.abs(d[b]) < thr) b--;
-    a = Math.max(0, a - Math.floor(sr * 0.02));   // keep a lead-in so the first consonant survives
-    b = Math.min(d.length - 1, b + Math.floor(sr * 0.03));
-    if (b - a < sr * 0.05) return arrayBuffer;
-
-    // Walk the trimmed region, copying audio through but clamping any silent run
-    // longer than MAX_GAP. Runs are measured on 10ms frames so a single quiet
-    // sample inside a word cannot split it.
-    const maxGap = Math.floor(sr * MAX_GAP);
-    const frame = Math.max(1, Math.floor(sr * 0.01));
-    const out = new Float32Array(b - a);
-    let w = 0, i = a, run = 0;
-    while (i <= b) {
-      const end = Math.min(i + frame, b + 1);
-      let amp = 0;
-      for (let k = i; k < end; k++) { const v = Math.abs(d[k]); if (v > amp) amp = v; }
-      if (amp < thr) {
-        run += end - i;
-        if (run <= maxGap) for (let k = i; k < end; k++) out[w++] = d[k];
-      } else {
-        run = 0;
-        for (let k = i; k < end; k++) out[w++] = d[k];
-      }
-      i = end;
-    }
-    if (w < sr * 0.05) return arrayBuffer;
-
-    const nb = ctx.createBuffer(1, w, sr);
-    nb.copyToChannel(out.subarray(0, w), 0);
-    return encodeWavAt(nb, sr);
-  } catch {
-    return arrayBuffer;   // never let cosmetics break playback
-  }
-}
-
-function playPCM(arrayBuffer) {
+// Schedule one block of PCM back-to-back with whatever is already queued.
+function schedule(f32, ctx) {
+  if (!f32.length) return;
   const rate = +speedEl.value || 1;
-  return new Promise((resolve) => {
-    const url = URL.createObjectURL(new Blob([arrayBuffer], { type: "audio/wav" }));
-    const a = new Audio();
-    a.src = url;
-    nowPlaying = a;
-    currentResolve = resolve;
-    // playbackRate MUST be applied after the media loads. Setting it before src is
-    // silently discarded when the element loads its source, which is why the speed
-    // slider appeared to do nothing. preservesPitch is set alongside it so the
-    // speed-up time-stretches instead of raising pitch.
-    const applyRate = () => {
-      a.preservesPitch = true;
-      a.mozPreservesPitch = true;
-      a.webkitPreservesPitch = true;
-      a.playbackRate = rate;
-    };
-    a.addEventListener("loadedmetadata", applyRate);
-    a.addEventListener("play", applyRate);
-    const done = () => {
-      URL.revokeObjectURL(url);
-      nowPlaying = null;
-      if (currentResolve === resolve) currentResolve = null;
-      resolve();
-    };
-    a.onended = done;
-    a.onerror = () => { URL.revokeObjectURL(url); playViaWebAudio(arrayBuffer, rate).then(resolve, resolve); };
-    a.play().catch(() => {
-      URL.revokeObjectURL(url);
-      playViaWebAudio(arrayBuffer, rate).then(resolve, resolve);
-    });
-  });
+  const buf = ctx.createBuffer(1, f32.length, SR);
+  buf.copyToChannel(f32, 0);
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  // playbackRate shifts pitch slightly; preservesPitch is not available on a
+  // BufferSource. At 1.1-1.2x that is a small trade for gapless output.
+  src.playbackRate.value = rate;
+  src.connect(ctx.destination);
+  const now = ctx.currentTime;
+  if (nextAt < now + 0.02) nextAt = now + 0.02;   // never schedule in the past
+  src.start(nextAt);
+  nextAt += buf.duration / rate;
+  liveSources.push(src);
+  src.onended = () => { liveSources = liveSources.filter((x) => x !== src); };
 }
 
-function playViaWebAudio(arrayBuffer, rate) {
-  return new Promise((resolve, reject) => {
-    if (!audioCtx) { resolve(); return; }
-    audioCtx.decodeAudioData(arrayBuffer.slice(0), (buf) => {
-      const src = audioCtx.createBufferSource();
-      src.buffer = buf;
-      src.playbackRate.value = rate;   // shifts pitch, but only used as a fallback
-      src.connect(audioCtx.destination);
-      src.onended = resolve;
-      src.start();
-    }, reject);
+async function speakStream(text, myGen) {
+  const eng = ENGINES[engineEl.value] || ENGINES.qwen;
+  const body = eng.body(text);
+  // Kokoro (speaches) does not implement the streaming pcm format, so it keeps
+  // the one-shot wav path.
+  const canStream = engineEl.value === "qwen";
+  body.response_format = canStream ? "pcm" : "wav";
+
+  const r = await fetch(eng.url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
   });
+  if (!r.ok) throw new Error(eng.label + " TTS " + r.status);
+
+  const ctx = ensureCtx();
+  if (ctx.state === "suspended") await ctx.resume();
+
+  if (!canStream) {
+    const wav = await r.arrayBuffer();
+    const decoded = await ctx.decodeAudioData(wav.slice(0));
+    schedule(decoded.getChannelData(0), ctx);
+    return;
+  }
+
+  const reader = r.body.getReader();
+  let carry = new Uint8Array(0);
+  let started = false;
+  let pre = [];
+  let preLen = 0;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done || myGen !== gen) break;
+
+    // s16le: keep a trailing odd byte for the next block.
+    let bytes = value;
+    if (carry.length) {
+      const merged = new Uint8Array(carry.length + bytes.length);
+      merged.set(carry); merged.set(bytes, carry.length);
+      bytes = merged; carry = new Uint8Array(0);
+    }
+    const usable = bytes.length - (bytes.length % 2);
+    if (usable < bytes.length) carry = bytes.slice(usable);
+
+    const n = usable / 2;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, usable);
+    const f32 = new Float32Array(n);
+    for (let i = 0; i < n; i++) f32[i] = view.getInt16(i * 2, true) / 32768;
+
+    if (!started) {
+      // Hold a little audio back before starting, so a slow first block does not
+      // cause an immediate underrun.
+      pre.push(f32); preLen += n;
+      if (preLen >= SR * PREBUFFER) {
+        const all = new Float32Array(preLen);
+        let o = 0;
+        for (const b of pre) { all.set(b, o); o += b.length; }
+        schedule(all, ctx);
+        pre = []; preLen = 0; started = true;
+        setStatus("speaking…");
+      }
+    } else {
+      schedule(f32, ctx);
+    }
+  }
+
+  // Flush anything still held in the prebuffer.
+  if (pre.length && myGen === gen) {
+    const all = new Float32Array(preLen);
+    let o = 0;
+    for (const b of pre) { all.set(b, o); o += b.length; }
+    schedule(all, ctx);
+  }
 }
 
 // ---- recording ------------------------------------------------------------
@@ -492,32 +433,11 @@ micEl.addEventListener("click", async () => {
 });
 
 // ---- stop -----------------------------------------------------------------
-// Cancels everything in flight: the LLM stream, any queued or in-progress
-// synthesis, and whatever is currently playing. Without this a long reply had to
-// be waited out — there was no way to interrupt it.
+// stopAll itself lives with the audio pipeline above, since cancelling is mostly
+// a matter of orphaning the scheduler. These are the bits the rest of the file
+// needs.
 const stopEl = document.getElementById("stop");
 let abortCtl = null;
-let nowPlaying = null;
-
-function stopAll() {
-  gen++;                                 // orphan any running play loop
-  if (abortCtl) { abortCtl.abort(); abortCtl = null; }
-  slots.length = 0;                      // drop pending synthesis
-  pendingText.length = 0;                // and anything not yet dispatched
-  if (nowPlaying) {
-    try { nowPlaying.pause ? nowPlaying.pause() : nowPlaying.stop(); } catch {}
-    nowPlaying = null;
-  }
-  // Settle the in-flight clip's promise; a paused <audio> never fires onended, so
-  // without this the old loop would await it forever.
-  if (currentResolve) { const r = currentResolve; currentResolve = null; r(); }
-  playing = false;
-  busy = false;
-  micEl.disabled = false;
-  sendEl.disabled = false;
-  stopEl.hidden = true;
-  setStatus("stopped");
-}
 stopEl.addEventListener("click", stopAll);
 
 // ---- voice cloning --------------------------------------------------------
