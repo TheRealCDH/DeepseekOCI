@@ -65,11 +65,18 @@
   <div class="opts">
     <label><input type="checkbox" id="thinking" checked> Thinking (slower, better)</label>
     <label><input type="checkbox" id="speak" checked> Speak replies</label>
-    <label>Voice
+    <label>Engine
       <select id="engine">
         <option value="qwen" selected>Qwen3 (cloning)</option>
         <option value="kokoro">Kokoro (faster)</option>
       </select>
+    </label>
+    <label>Voice
+      <select id="voice"><option value="ryan">ryan</option></select>
+    </label>
+    <label>Speed
+      <input id="speed" type="range" min="1" max="1.6" step="0.05" value="1.15">
+      <span id="speedval">1.15x</span>
     </label>
   </div>
   </div>
@@ -92,7 +99,20 @@ const ENGINES = {
   qwen: {
     label: "Qwen3",
     url: "/v1/audio/speech",
-    body: (t) => ({ input: t, voice: "ryan", response_format: "wav" }),
+    voicesUrl: "/v1/audio/voices",
+    body: (t) => ({
+      input: t,
+      voice: voiceEl.value || "ryan",
+      response_format: "wav",
+      // Guards against the model looping into breathing/panting noises — a known
+      // failure mode of autoregressive TTS, where the sampler gets stuck emitting
+      // the same acoustic tokens forever. The engine's sampling chain is
+      // repetition penalty -> temperature -> top-k -> top-p, so a penalty above 1
+      // plus a slightly conservative temperature makes the loop far less likely.
+      repetition_penalty: 1.1,
+      temperature: 0.7,
+      top_p: 0.9,
+    }),
   },
   kokoro: {
     label: "Kokoro",
@@ -112,6 +132,32 @@ const statusEl = document.getElementById("status");
 const thinkEl = document.getElementById("thinking");
 const speakEl = document.getElementById("speak");
 const engineEl = document.getElementById("engine");
+const voiceEl = document.getElementById("voice");
+const speedEl = document.getElementById("speed");
+const speedValEl = document.getElementById("speedval");
+speedEl.addEventListener("input", () => { speedValEl.textContent = (+speedEl.value).toFixed(2) + "x"; });
+
+// The engines have disjoint voice sets, so repopulate whenever the engine changes.
+const KOKORO_VOICES = ["af_heart", "af_bella", "af_nicole", "am_michael", "bf_emma", "bm_george"];
+async function loadVoices() {
+  const eng = engineEl.value;
+  let names = KOKORO_VOICES;
+  if (eng === "qwen") {
+    try {
+      const r = await fetch(ENGINES.qwen.voicesUrl);
+      const d = await r.json();
+      names = (d.voices || []).map((v) => v.name);
+    } catch { names = ["ryan"]; }
+  }
+  voiceEl.innerHTML = "";
+  for (const n of names) {
+    const o = document.createElement("option");
+    o.value = n; o.textContent = n;
+    voiceEl.appendChild(o);
+  }
+}
+engineEl.addEventListener("change", loadVoices);
+loadVoices();
 
 let recorder = null, chunks = [], recording = false, busy = false;
 let audioCtx = null;
@@ -174,14 +220,40 @@ async function play() {
   playing = false;
 }
 
-// Decoded through WebAudio rather than <audio>, because Android blocks
-// programmatic <audio>.play() outside a user gesture; the AudioContext is
-// unlocked by the mic tap and then stays usable.
+// Playback. Qwen3 speaks at ~127 wpm against ~150 for normal conversation, and the
+// engine exposes no speed parameter, so the correction has to happen client side.
+//
+// An <audio> element is preferred because preservesPitch time-stretches WITHOUT the
+// chipmunk effect; AudioBufferSourceNode.playbackRate would shift pitch instead. The
+// AudioContext is still created on the first user gesture and kept as a fallback,
+// since it is the path already proven to satisfy Android's autoplay policy.
 function playPCM(arrayBuffer) {
+  const rate = +speedEl.value || 1;
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(new Blob([arrayBuffer], { type: "audio/wav" }));
+    const a = new Audio();
+    a.preservesPitch = true;
+    a.mozPreservesPitch = true;
+    a.webkitPreservesPitch = true;
+    a.playbackRate = rate;
+    a.src = url;
+    const done = () => { URL.revokeObjectURL(url); resolve(); };
+    a.onended = done;
+    a.onerror = () => { URL.revokeObjectURL(url); playViaWebAudio(arrayBuffer, rate).then(resolve, resolve); };
+    a.play().catch(() => {
+      URL.revokeObjectURL(url);
+      playViaWebAudio(arrayBuffer, rate).then(resolve, resolve);
+    });
+  });
+}
+
+function playViaWebAudio(arrayBuffer, rate) {
   return new Promise((resolve, reject) => {
+    if (!audioCtx) { resolve(); return; }
     audioCtx.decodeAudioData(arrayBuffer.slice(0), (buf) => {
       const src = audioCtx.createBufferSource();
       src.buffer = buf;
+      src.playbackRate.value = rate;   // shifts pitch, but only used as a fallback
       src.connect(audioCtx.destination);
       src.onended = resolve;
       src.start();
