@@ -48,6 +48,11 @@ spec:
             - /models/qwen3-tts/qwen-tokenizer-12hz-Q8_0.gguf
             - --alias
             - qwen3-tts
+            # Default is 1, which serialises requests on the GPU. The UI synthesises the
+            # next sentence while the current one plays (up to 3 in flight), so without
+            # this those requests queue instead of batching and the prefetch buys nothing.
+            - --max-batch
+            - "4"
             - --host
             - 0.0.0.0
             - --port
