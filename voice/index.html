@@ -108,7 +108,8 @@ const ENGINES = {
     voicesUrl: "/v1/audio/voices",
     body: (t) => ({
       input: t,
-      voice: voiceEl.value || "ryan",
+      // Omit `voice` entirely for the default — the base model picks its own.
+      ...(voiceEl.value && voiceEl.value !== "(default)" ? { voice: voiceEl.value } : {}),
       response_format: "wav",
       // Guards against the model looping into breathing/panting noises — a known
       // failure mode of autoregressive TTS, where the sampler gets stuck emitting
@@ -156,6 +157,9 @@ async function loadVoices() {
     } catch { names = ["ryan"]; }
   }
   voiceEl.innerHTML = "";
+  // The base checkpoint ships no named speakers — it has one default voice and
+  // whatever has been cloned. An empty list is normal, not an error.
+  if (eng === "qwen" && !names.length) names = ["(default)"];
   for (const n of names) {
     const o = document.createElement("option");
     o.value = n; o.textContent = n;
