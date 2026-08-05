@@ -1,8 +1,10 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: deepseek
-
+# Two independent stacks, each pinning its own namespace in its own kustomization.
+# The `namespace:` transformer used to live here, which forced EVERY resource into
+# `deepseek` — fine while this repo held one workload, but it would have silently
+# dragged the speech stack in with it.
 resources:
-  - namespace.yaml
   - deepseek
+  - speech

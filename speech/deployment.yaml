@@ -1,0 +1,99 @@
+# speaches — OpenAI-compatible STT + TTS, on the GTX 1070 Ti.
+#
+# WHY ONE POD FOR BOTH JOBS: the node advertises `nvidia.com/gpu: 1`, so exactly one pod
+# can claim the card. Running STT and TTS in a single process avoids GPU time-slicing
+# entirely — and time-slicing is worth avoiding, because it gives no VRAM isolation and no
+# fairness between the sharers.
+#
+# WHY THE GPU AT ALL, given Pascal is slow: because the CPU is the scarce resource here,
+# not the GPU. llama-server consumes ~25-29 of 32 threads during decode with the machine
+# at 96-99% busy, so every CPU cycle spent on speech is taken directly from the LLM. The
+# card sits otherwise idle since Jellyfin moved to VAAPI on the AMD.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: speaches
+  labels:
+    app.kubernetes.io/name: speaches
+spec:
+  replicas: 1
+  strategy:
+    # Only one pod can hold nvidia.com/gpu:1 — a rolling update would deadlock waiting
+    # for the new pod to get a card the old pod still holds.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: speaches
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: speaches
+    spec:
+      runtimeClassName: nvidia
+      nodeSelector:
+        kubernetes.io/hostname: ripnix
+      initContainers:
+        # speaches runs as uid 1000 and cannot mkdir inside the root-owned /models
+        # hostPath. Without this the app 500s on every request with
+        # `CacheNotFound: /models/hf-cache/hub`.
+        - name: prepare-cache
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - mkdir -p /models/hf-cache/hub && chown -R 1000:1000 /models/hf-cache
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        - name: speaches
+          image: ghcr.io/speaches-ai/speaches@sha256:9abc6968a883e77ead9286c38a6ccf3139dcad518b783deeebb7be2ced50e972
+          env:
+            # INT8 for Whisper is correct: CTranslate2 uses the DP4A path, and Pascal
+            # (sm_61) runs FP16 at 1/64 rate, so FP16 here would be pathological.
+            #
+            # NOTE the opposite is true for the TTS model — see tts-model note below.
+            - name: WHISPER__COMPUTE_TYPE
+              value: "int8"
+            - name: HF_HOME
+              value: "/models/hf-cache"
+            # Points the built-in /v1/realtime voice path at the local DeepSeek instead of
+            # the upstream default (http://localhost:11434/v1, i.e. Ollama), which does not
+            # exist on this cluster.
+            - name: CHAT_COMPLETION_BASE_URL
+              value: "http://deepseek.deepseek.svc.cluster.local:8080/v1"
+            - name: CHAT_COMPLETION_API_KEY
+              value: "unused-local"
+          ports:
+            - containerPort: 8000
+              name: http
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+              memory: 12Gi
+            requests:
+              cpu: "1"
+              memory: 2Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 10
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
+      volumes:
+        # Models are pulled from HuggingFace on first use and cached here. /models is the
+        # same ZFS dataset the 85 GiB LLM GGUF lives on, so the cache survives pod
+        # restarts and re-pulls cost nothing.
+        - name: models
+          hostPath:
+            path: /models
+            type: Directory

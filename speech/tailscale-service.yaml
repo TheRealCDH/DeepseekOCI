@@ -1,0 +1,22 @@
+# Tailnet exposure via the Tailscale Kubernetes operator, same pattern as deepseek.
+#
+# Reachable at http://speech:8000 from tailnet devices that carry the tailnet search
+# domain; use the fully-qualified MagicDNS name otherwise (the workstation has no search
+# domain configured, so the short name will not resolve there).
+apiVersion: v1
+kind: Service
+metadata:
+  name: speaches-tailscale
+  annotations:
+    tailscale.com/expose: "true"
+    tailscale.com/hostname: "speech"
+  labels:
+    app.kubernetes.io/name: speaches
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: speaches
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

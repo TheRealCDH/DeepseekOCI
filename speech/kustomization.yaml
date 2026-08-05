@@ -1,9 +1,7 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Pinned here rather than at the repo root, so adding a second stack cannot pull it
-# into this namespace.
-namespace: deepseek
+namespace: speech
 
 resources:
   - namespace.yaml
