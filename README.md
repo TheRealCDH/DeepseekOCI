@@ -32,7 +32,7 @@ architectures win because only the active parameters are read per token.
 ## Layout
 
 ```
-kustomization.yaml          the two stacks below
+kustomization.yaml          the three stacks below
 deepseek/                   the LLM — CPU only
   namespace.yaml
   kustomization.yaml        pins namespace: deepseek
@@ -56,7 +56,7 @@ voice/                      browser UI, HTTPS
 ```
 
 Each stack pins its own namespace in its own `kustomization.yaml`. The root kustomization
-deliberately sets no `namespace:` — it used to, which would have dragged the speech stack
+deliberately sets no `namespace:` — it used to, which would have dragged every later stack
 into the `deepseek` namespace.
 
 ## Speech stack
