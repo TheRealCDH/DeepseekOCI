@@ -215,15 +215,30 @@ let gen = 0;
 // Resolver for the clip currently playing, so stopAll can complete the promise a
 // paused <audio> would otherwise never settle (pause does not fire onended).
 let currentResolve = null;
-// 2 = one clip playing while the next synthesises. Higher values only batch on
-// the GPU and delay the first word; synthesis already runs ~3.6x realtime, so one
-// clip of lookahead is enough to keep playback gapless.
-const MAX_INFLIGHT = 2;
+// 3 = one clip playing plus two synthesising ahead.
+//
+// One clip of lookahead was not enough because synthesis time does NOT track
+// audio length. There is a fixed ~1s cost per request, so short clips are far
+// worse than linear (measured on a cloned voice):
+//
+//    10 chars -> synth 1.29s for 1.12s audio = 0.87x realtime
+//    68 chars -> synth 2.44s for 4.64s audio = 1.9x
+//   152 chars -> synth 3.61s for 8.16s audio = 2.3x
+//
+// A short clip therefore buys only ~1s of playback while the next still costs
+// seconds, the queue drains, and a gap appears — which is exactly why some
+// sentences followed instantly and others stalled. Two clips of lookahead absorb
+// that variance. The first chunk is dispatched alone so it does not batch, and
+// first-word latency is unaffected.
+const MAX_INFLIGHT = 3;
 // Minimum characters before a chunk is sent for synthesis. Larger chunks mean
 // fewer utterance onsets and more natural phrasing across a sentence boundary;
 // too large and the first audio is slow to arrive. ~90 chars is roughly one
 // full sentence.
 const MIN_CHUNK = 90;
+// Floor for the opening chunk. Low enough to start speaking quickly, high enough
+// that its playback covers the synthesis of what follows.
+const FIRST_CHUNK = 45;
 
 function synth(text) {
   const eng = ENGINES[engineEl.value] || ENGINES.qwen;
@@ -811,10 +826,11 @@ async function ask(text) {
           // a separate synthesis with its own onset, so "Yes." "Sure." "OK." as
           // three requests sounds far more disjointed than one. Anything past the
           // threshold, or the tail at end of stream, goes immediately.
-          // The FIRST chunk goes out as soon as a sentence completes so speech
-          // starts promptly; later chunks wait for MIN_CHUNK so phrasing stays
-          // fluid. Waiting for 90 chars on the first one just delays the opening.
-          if (!spoken || chunk.length >= MIN_CHUNK || !rest) {
+          // The first chunk goes out early so speech starts promptly, but not at
+          // ANY length: a one-second opening clip is followed by a multi-second
+          // synthesis and leaves an obvious hole. FIRST_CHUNK is the floor that
+          // buys enough playback to cover the next request.
+          if ((!spoken && chunk.length >= FIRST_CHUNK) || chunk.length >= MIN_CHUNK || !rest) {
             spoken += chunk;
             enqueue(chunk);
           }
